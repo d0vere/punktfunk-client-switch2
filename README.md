@@ -38,7 +38,7 @@ You can check more in punktfunk [quickstart](https://docs.punktfunk.unom.io/docs
   reconnecting is still being working. 
 - **Your controllers, as they are.** Joy-Cons and the Pro Controller, with HD rumble, gyro and
   the touch screen.
-- **Low latency.** About 30–45 ms from the PC's screen to yours, on a good network.
+- **Low latency.** About 15–20 ms from the PC's screen to yours, on a good network.
 - **Two presentation modes.** *Smoothness* gives a very smooth picture at an acceptable
   latency. *Low latency* cuts the delay further, at the cost of some smoothness.
 - **Easy to set up, easy to use.** You pair once, and from then on it is one
