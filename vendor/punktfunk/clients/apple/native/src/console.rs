@@ -1,0 +1,926 @@
+//! The console's C ABI: the shared shell drawn by Skia's Metal backend into a texture Swift
+//! hands over each display-link tick. Swift keeps the device, the queue and the drawables, and
+//! presents after `punktfunk_console_frame` returns; Skia's work is already on that queue.
+//!
+//! The shell is bound to the thread that created it: `frame`, `menu`, `pointer`, `key`, `text`,
+//! `phase` and `free` run there (the main thread). `push`, `art`, `next_event` and `drain_cmds`
+//! are safe from any thread. The JSON is `pf_console_ui::bridge`'s, which Android speaks too.
+
+use pf_client_core::console::OverlayAction;
+use pf_console_ui::bridge::{
+    self, CreateOptions, EntryJson, Event, GamesPush, MenuCode, Pads, PadsJson, PhasePush,
+    PresetJson, Published,
+};
+use pf_console_ui::console::FrameCost;
+use pf_console_ui::{
+    Console, ConsoleEntry, ConsoleHandles, HiddenAnswer, HideAnswer, HostRow, InputSource, Insets,
+    LicenseSection, PadTestState, PairStatus, Platform, ProfilesAnswer, Prompt, SnapshotStore,
+    SpeedPhase, Viewport, WakeStatus,
+};
+use punktfunk_core::quic::v2::msg::{ProfileUnlock, UNLOCK_PASSWORD, UNLOCK_PASSWORD_MAX};
+use skia_safe::gpu::{self, mtl, DirectContext, SurfaceOrigin};
+use skia_safe::ColorType;
+use std::collections::VecDeque;
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
+
+/// A frame at most this often once the console is idle.
+const IDLE_FRAME: Duration = Duration::from_micros(33_333);
+
+/// What a layer's texture can wrap as: BGR10A2Unorm, RGB10A2Unorm (the Mac's), BGRA8Unorm.
+const COLOR_TYPES: [ColorType; 3] = [
+    ColorType::BGRA1010102,
+    ColorType::RGBA1010102,
+    ColorType::BGRA8888,
+];
+
+/// Safe-area insets in texture pixels.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PunktfunkInsets {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+// `punktfunk_console_push` kinds, each with the JSON it takes.
+
+/// `[HostRow]` — the home carousel.
+pub const PUNKTFUNK_CONSOLE_PUSH_HOSTS: u8 = 0;
+/// `{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`, `req` the
+/// `Pair` or `RequestAccess` command's.
+pub const PUNKTFUNK_CONSOLE_PUSH_PAIR: u8 = 1;
+/// `WakeStatus` under the `Wake`'s `req`, or `null` when the wake ended.
+pub const PUNKTFUNK_CONSOLE_PUSH_WAKE: u8 = 2;
+/// A JSON string: a one-shot toast.
+pub const PUNKTFUNK_CONSOLE_PUSH_NOTICE: u8 = 3;
+/// `{"key": "…", "phase": SpeedPhase}` — the speed test on that host moved on.
+pub const PUNKTFUNK_CONSOLE_PUSH_SPEED: u8 = 4;
+/// Any JSON: a library fetch is starting for the shelf on screen.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN: u8 = 5;
+/// `{"req": …, "phase": "Loading" | "Empty" | "Ready" | {"Error": {"title", "body",
+/// "can_retry"}}}`, `req` the `FetchLibrary`'s.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE: u8 = 6;
+/// `{"req": …, "games": [LibraryGame]}` — the fetched catalog for that `FetchLibrary`.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES: u8 = 7;
+/// `{"req": …, "games": [LibraryGame]}` — the cached catalog, shown while the fetch runs.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED: u8 = 8;
+/// `[{"app_id": "steam:570", "state": "running"}]` — the host's running games.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING: u8 = 9;
+/// `0` fresh, `1` waking, `2` offline.
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE: u8 = 10;
+/// `[{"app_id", "state", "done_bytes", …}]` — the host's downloads, pushed before the same
+/// read's [`PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING`].
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS: u8 = 19;
+/// `Settings` changed elsewhere; the shell reads it on its next mutation. Not a save.
+pub const PUNKTFUNK_CONSOLE_PUSH_SETTINGS: u8 = 11;
+/// `[{id, name, overrides}]` — the preset catalog.
+pub const PUNKTFUNK_CONSOLE_PUSH_PRESETS: u8 = 12;
+/// `KnownHosts` — the records `punktfunk://` links are built from.
+pub const PUNKTFUNK_CONSOLE_PUSH_KNOWN_HOSTS: u8 = 13;
+/// `{"label", "pref", "pads": [PadInfo]}` — the connected controllers.
+pub const PUNKTFUNK_CONSOLE_PUSH_PADS: u8 = 14;
+/// `{}` for Home, `{"library": HostRow}` for a shelf — re-roots on the next frame.
+pub const PUNKTFUNK_CONSOLE_PUSH_NAVIGATE: u8 = 15;
+/// `{"id", "title", "message", "choices": [..]}` — a question over the top screen; the
+/// answer comes back as the `PromptAnswer` command.
+pub const PUNKTFUNK_CONSOLE_PUSH_PROMPT: u8 = 16;
+/// `[{"heading", "text"}]` — what this app bundles, for the Licences screen. The answer to
+/// the `LoadLicenses` command.
+pub const PUNKTFUNK_CONSOLE_PUSH_LICENSES: u8 = 17;
+/// `{"held": [..], "axes": [[name, v]]}` — the pad's reading while the `PadTest` command is on.
+pub const PUNKTFUNK_CONSOLE_PUSH_PAD_TEST: u8 = 18;
+/// `{"fp_hex": "…", "answer": ProfilesAnswer}` — the answer to the `FetchProfiles` command:
+/// `{"Listed": [rows]}`, `"NoProfiles"` or `{"Failed": "why"}`.
+pub const PUNKTFUNK_CONSOLE_PUSH_PROFILES: u8 = 20;
+/// `{"fp_hex": "…", "profile": "…", "answer": HiddenAnswer}` — the answer to the `FetchHidden`
+/// command: `{"Listed": [LibraryGame]}` or `{"Failed": "why"}`.
+pub const PUNKTFUNK_CONSOLE_PUSH_HIDDEN: u8 = 21;
+/// `HideAnswer` — the answer to the `SetHidden` command, echoing its host, profile and title.
+pub const PUNKTFUNK_CONSOLE_PUSH_HIDE: u8 = 22;
+
+/// The room `punktfunk_console_take_unlock` needs: the longest password the wire takes.
+pub const PUNKTFUNK_CONSOLE_UNLOCK_MAX: usize = 512;
+const _: () = assert!(PUNKTFUNK_CONSOLE_UNLOCK_MAX == UNLOCK_PASSWORD_MAX);
+
+/// One console. Opaque to C.
+pub struct PunktfunkConsole {
+    owner: ThreadId,
+    shell: Mutex<Shell>,
+    handles: ConsoleHandles,
+    store: Arc<SnapshotStore>,
+    events: Mutex<VecDeque<Event>>,
+    /// Pushed from any thread, read by the next frame.
+    pads: Mutex<Pads>,
+    navigate: Mutex<Option<ConsoleEntry>>,
+    prompt: Mutex<Option<Prompt>>,
+}
+
+struct Shell {
+    console: Console,
+    context: DirectContext,
+    published: Published,
+    cost: FrameCost,
+    /// When the last frame was drawn, and at what size.
+    drawn: Option<(Instant, u32, u32)>,
+    /// The colour type the layer's texture last wrapped as. Swift owns the format; Skia
+    /// refuses a mismatch, so a refused wrap tries [`COLOR_TYPES`] and sticks with the one
+    /// that takes.
+    color_type: ColorType,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The console, a name and an encoded image, as the entry points taking one receive them.
+/// `None` when any is missing.
+///
+/// # Safety
+/// `c` is NULL or live; `name` is NULL or a NUL-terminated string; `bytes` is `len` readable bytes.
+unsafe fn image_args<'a>(
+    c: *const PunktfunkConsole,
+    name: *const c_char,
+    bytes: *const u8,
+    len: usize,
+) -> Option<(&'a PunktfunkConsole, &'a str, Vec<u8>)> {
+    // SAFETY: live and NUL-terminated per this function's contract.
+    let (c, name) = (unsafe { c.as_ref() }?, unsafe { str_arg(name) }?);
+    if bytes.is_null() || len == 0 {
+        return None;
+    }
+    // SAFETY: `len` readable bytes per this function's contract.
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    Some((c, name, bytes))
+}
+
+/// Run `f`, turning a panic into `default`: unwinding across the C boundary is undefined.
+fn guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
+
+/// # Safety
+/// `p` is NULL or a NUL-terminated string.
+unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: non-NULL and NUL-terminated per this function's contract.
+    unsafe { CStr::from_ptr(p) }.to_str().ok()
+}
+
+fn json<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    match serde_json::from_str(text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!("console: bad JSON from Swift: {e} in {text:.200}");
+            None
+        }
+    }
+}
+
+fn out_string(s: String) -> *mut c_char {
+    CString::new(s).map_or(std::ptr::null_mut(), CString::into_raw)
+}
+
+impl PunktfunkConsole {
+    /// The shell, if this is its thread.
+    fn shell(&self) -> Option<MutexGuard<'_, Shell>> {
+        if std::thread::current().id() != self.owner {
+            tracing::error!("console: called off the thread that created it; ignored");
+            return None;
+        }
+        Some(lock(&self.shell))
+    }
+
+    /// Queue what the shell raised. `true` = it asked to quit.
+    fn publish(&self, shell: &mut Shell) -> bool {
+        let mut quit = false;
+        let mut events = lock(&self.events);
+        let Shell {
+            console, published, ..
+        } = shell;
+        published.publish(console, &self.store, |e| {
+            quit |= matches!(e, Event::Action(OverlayAction::Quit));
+            events.push_back(e);
+        });
+        quit
+    }
+}
+
+/// Build a console over Swift's Metal device and queue. `options_json` is the bridge's
+/// `CreateOptions`. NULL if the JSON or Skia's Metal context fails; the log says which.
+///
+/// # Safety
+/// `options_json` is a NUL-terminated string. `mtl_device` and `mtl_queue` are a live
+/// `id<MTLDevice>` and an `id<MTLCommandQueue>` on it; the console retains both.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_new(
+    options_json: *const c_char,
+    mtl_device: *mut c_void,
+    mtl_queue: *mut c_void,
+) -> *mut PunktfunkConsole {
+    guard(std::ptr::null_mut(), || {
+        // SAFETY: NUL-terminated per this function's contract.
+        let Some(opts) = unsafe { str_arg(options_json) }.and_then(json::<CreateOptions>) else {
+            return std::ptr::null_mut();
+        };
+        if mtl_device.is_null() || mtl_queue.is_null() {
+            return std::ptr::null_mut();
+        }
+        let (opts, entry, store) = opts.into_console(Platform::Apple);
+        let cache_bytes = opts.gpu_cache_bytes;
+        // SAFETY: a live device and a queue on it, per this function's contract; Skia retains
+        // both for the context's lifetime.
+        let backend =
+            unsafe { mtl::BackendContext::new(mtl_device.cast_const(), mtl_queue.cast_const()) };
+        let Some(mut context) = gpu::direct_contexts::make_metal(&backend, None) else {
+            tracing::error!("console: Skia's Metal context did not come up");
+            return std::ptr::null_mut();
+        };
+        context.set_resource_cache_limit(cache_bytes);
+        let handles = ConsoleHandles::new();
+        let console = match Console::new(opts, entry, &handles) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("console: {e:#}");
+                return std::ptr::null_mut();
+            }
+        };
+        let published = Published::new(&console, &store);
+        Box::into_raw(Box::new(PunktfunkConsole {
+            owner: std::thread::current().id(),
+            shell: Mutex::new(Shell {
+                console,
+                context,
+                published,
+                cost: FrameCost::default(),
+                drawn: None,
+                color_type: ColorType::BGRA1010102,
+            }),
+            handles,
+            store,
+            events: Mutex::new(VecDeque::new()),
+            pads: Mutex::new((None, None, Vec::new())),
+            navigate: Mutex::new(None),
+            prompt: Mutex::new(None),
+        }))
+    })
+}
+
+/// Free a console. NULL is a no-op. Off the creating thread it leaks rather than drop the
+/// shell there.
+///
+/// # Safety
+/// `c` is NULL or from `punktfunk_console_new`, and is not used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_free(c: *mut PunktfunkConsole) {
+    guard((), || {
+        if c.is_null() {
+            return;
+        }
+        // SAFETY: from `punktfunk_console_new` and not used again, per the contract.
+        let c = unsafe { Box::from_raw(c) };
+        if std::thread::current().id() != c.owner {
+            tracing::error!("console: freed off the thread that created it; leaked");
+            std::mem::forget(c);
+        }
+    })
+}
+
+/// Draw one frame into `mtl_texture` (`width`×`height`) and submit it to the queue.
+/// `scale` is device pixels per design unit; `0` takes the shell's own formula. `false` =
+/// nothing drawn (idle, or the texture could not be wrapped): present nothing.
+///
+/// # Safety
+/// `c` is live. `mtl_texture` is an `id<MTLTexture>` from the console's device, render-target
+/// usable, BGR10A2Unorm, RGB10A2Unorm or BGRA8Unorm, at least `width`×`height`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_frame(
+    c: *const PunktfunkConsole,
+    mtl_texture: *mut c_void,
+    width: u32,
+    height: u32,
+    insets: PunktfunkInsets,
+    scale: f64,
+) -> bool {
+    guard(false, || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return false;
+        };
+        let Some(mut shell) = c.shell() else {
+            return false;
+        };
+        if mtl_texture.is_null() || width == 0 || height == 0 {
+            return false;
+        }
+        if let Some(entry) = lock(&c.navigate).take() {
+            shell.console.navigate(entry);
+        }
+        if let Some(prompt) = lock(&c.prompt).take() {
+            shell.console.prompt(prompt);
+        }
+        let now = Instant::now();
+        if let Some((at, w, h)) = shell.drawn {
+            if shell.console.idle() && now - at < IDLE_FRAME && (w, h) == (width, height) {
+                return false;
+            }
+        }
+        // SAFETY: a live texture from this device, per the contract; Skia retains it while
+        // the render target lives.
+        let info = unsafe { mtl::TextureInfo::new(mtl_texture.cast_const()) };
+        let target = gpu::backend_render_targets::make_mtl((width as i32, height as i32), &info);
+        let mut wrapped = None;
+        for ct in std::iter::once(shell.color_type).chain(COLOR_TYPES) {
+            wrapped = gpu::surfaces::wrap_backend_render_target(
+                &mut shell.context,
+                &target,
+                SurfaceOrigin::TopLeft,
+                ct,
+                None,
+                None,
+            );
+            if wrapped.is_some() {
+                shell.color_type = ct;
+                break;
+            }
+        }
+        let Some(mut surface) = wrapped else {
+            tracing::error!("console: Skia could not wrap the {width}×{height} texture");
+            return false;
+        };
+        if shell
+            .drawn
+            .is_none_or(|(_, w, h)| (w, h) != (width, height))
+        {
+            tracing::info!("console: drawing at {width}×{height}");
+        }
+        let viewport = Viewport {
+            width,
+            height,
+            insets: Insets {
+                left: insets.left.max(0.0),
+                top: insets.top.max(0.0),
+                right: insets.right.max(0.0),
+                bottom: insets.bottom.max(0.0),
+            },
+            scale: (scale > 0.0).then_some(scale),
+        };
+        {
+            let pads = lock(&c.pads);
+            shell.console.frame(
+                surface.canvas(),
+                &viewport,
+                pads.0.as_deref(),
+                pads.1,
+                &pads.2,
+            );
+        }
+        drop(surface);
+        shell.context.flush_and_submit();
+        let done = Instant::now();
+        shell.drawn = Some((now, width, height));
+        if let Some(r) = shell.cost.add(done - now, done) {
+            tracing::info!(
+                "console: {width}×{height}, {} frames in {:?} — {:.1} ms/frame mean, {:.1} ms peak",
+                r.frames,
+                r.window,
+                r.mean_ms,
+                r.peak_ms,
+            );
+        }
+        c.publish(&mut shell);
+        true
+    })
+}
+
+/// A discrete menu event: 0..3 move up/down/left/right, 4 confirm, 5 back, 6 secondary (Y),
+/// 7 tertiary (X), 8 jump back (L1), 9 jump forward (R1), 10/11 a remote's OK down/up (acts
+/// on release, held it is the card's menu). `source` 1 = a pad (its glyphs), 0 = a remote or
+/// keyboard. `false` = Back at the root: the press is the system's.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_menu(
+    c: *const PunktfunkConsole,
+    event: u8,
+    source: u8,
+) -> bool {
+    guard(true, || {
+        let Some(code) = bridge::menu_code(event) else {
+            return true;
+        };
+        let source = if source == 1 {
+            InputSource::Pad
+        } else {
+            InputSource::Keys
+        };
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return true;
+        };
+        let Some(mut shell) = c.shell() else {
+            return true;
+        };
+        let pulse = match code {
+            MenuCode::Ok(down) => shell.console.ok(down, source),
+            MenuCode::Menu(ev) => shell.console.menu(ev, source),
+        };
+        if let Some(p) = pulse {
+            lock(&c.events).push_back(Event::Pulse(p));
+        }
+        !c.publish(&mut shell)
+    })
+}
+
+/// Whether a Back would leave the console rather than pop a screen. A tvOS host binds the
+/// Menu button only while this is false, so at the root the press reaches the system.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_at_root(c: *const PunktfunkConsole) -> bool {
+    guard(true, || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return true;
+        };
+        c.shell().is_none_or(|shell| shell.console.at_root())
+    })
+}
+
+/// Whether the console's launch hold is up. The app keeps the console over the stream it
+/// dialled while this is true, and gives the stream the screen once it is false.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_holds_launch(c: *const PunktfunkConsole) -> bool {
+    guard(false, || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return false;
+        };
+        c.shell().is_some_and(|shell| shell.console.holds_launch())
+    })
+}
+
+/// Touch or mouse in texture pixels: kind 0 move, 1 primary down (a mouse, acts at once),
+/// 2 primary up, 3 secondary down (= Back), 4 wheel (`dy` steps, + = up), 5 cancel,
+/// 6 primary down from a finger — deferred, so a swipe scrolls instead. `true` = consumed.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_pointer(
+    c: *const PunktfunkConsole,
+    kind: u8,
+    x: f32,
+    y: f32,
+    dy: f32,
+) -> bool {
+    guard(false, || {
+        let Some(input) = bridge::pointer_code(kind, x, y, dy) else {
+            return false;
+        };
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return false;
+        };
+        let Some(mut shell) = c.shell() else {
+            return false;
+        };
+        let used = shell.console.pointer(input);
+        c.publish(&mut shell);
+        used
+    })
+}
+
+/// A hardware key: 0..3 left/right/up/down, 4 return, 5 space, 6 escape, 7 backspace,
+/// 8 page up, 9 page down, 10 tab, 11 Y, 12 X. `true` = consumed.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_key(
+    c: *const PunktfunkConsole,
+    key: u8,
+    shift: bool,
+    repeat: bool,
+) -> bool {
+    guard(false, || {
+        let Some(key) = bridge::key_code(key) else {
+            return false;
+        };
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return false;
+        };
+        let Some(mut shell) = c.shell() else {
+            return false;
+        };
+        let used = shell.console.key(key, shift, repeat);
+        c.publish(&mut shell);
+        used
+    })
+}
+
+/// Typed text while the console reports `editing`.
+///
+/// # Safety
+/// `c` is live; `utf8` is a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_text(c: *const PunktfunkConsole, utf8: *const c_char) {
+    guard((), || {
+        // SAFETY: live and NUL-terminated per the contract.
+        let (Some(c), Some(text)) = (unsafe { c.as_ref() }, unsafe { str_arg(utf8) }) else {
+            return;
+        };
+        let Some(mut shell) = c.shell() else {
+            return;
+        };
+        shell.console.text(text);
+        c.publish(&mut shell);
+    })
+}
+
+/// Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed,
+/// 3 ended (`message` NULL or empty = clean), 4 reconnecting, 6 awaiting approval, 7 failed
+/// as `profile-locked` (`message` the host's sentence, empty when it said none).
+///
+/// # Safety
+/// `c` is live; `message` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_phase(
+    c: *const PunktfunkConsole,
+    phase: u8,
+    message: *const c_char,
+) {
+    guard((), || {
+        // SAFETY: live and NULL-or-NUL-terminated per the contract.
+        let (Some(c), msg) = (unsafe { c.as_ref() }, unsafe { str_arg(message) }) else {
+            return;
+        };
+        let (code, Some(phase)) = (phase, bridge::phase_code(phase, msg.unwrap_or(""))) else {
+            return;
+        };
+        let Some(mut shell) = c.shell() else {
+            return;
+        };
+        if code == bridge::PHASE_PROFILE_LOCKED {
+            shell.console.profile_locked();
+        }
+        shell.console.session_phase(phase);
+        c.publish(&mut shell);
+    })
+}
+
+/// Moves the password the console's prompt typed for the `Launch` it just raised into `out`,
+/// its "Stay signed in" switch into `*stay`, and returns its length: 0 when the console holds
+/// none. The console's copy is wiped either way, so call it once per `Launch`, first.
+///
+/// # Safety
+/// `c` is live; `out` is NULL or `cap` writable bytes; `stay` is NULL or a writable `bool`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_take_unlock(
+    c: *const PunktfunkConsole,
+    out: *mut u8,
+    cap: usize,
+    stay: *mut bool,
+) -> usize {
+    guard(0, || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return 0;
+        };
+        let taken = c.handles.console.take_unlock();
+        if out.is_null() || stay.is_null() {
+            return 0;
+        }
+        // SAFETY: `out` is `cap` writable bytes and `stay` a writable `bool`, per the contract.
+        let (out, stay) = unsafe { (std::slice::from_raw_parts_mut(out, cap), &mut *stay) };
+        hand_over(taken, out, stay)
+    })
+}
+
+/// Copies a password unlock that fits into `out` and answers its length; anything else answers
+/// 0. `unlock` wipes as it drops.
+fn hand_over(unlock: Option<ProfileUnlock>, out: &mut [u8], stay: &mut bool) -> usize {
+    let Some(u) = unlock.filter(|u| u.kind == UNLOCK_PASSWORD && u.secret.len() <= out.len())
+    else {
+        return 0;
+    };
+    out[..u.secret.len()].copy_from_slice(&u.secret);
+    *stay = u.stay_signed_in;
+    u.secret.len()
+}
+
+#[derive(serde::Deserialize)]
+struct SpeedJson {
+    key: String,
+    phase: SpeedPhase,
+}
+
+#[derive(serde::Deserialize)]
+struct ProfilesJson {
+    fp_hex: String,
+    answer: ProfilesAnswer,
+}
+
+#[derive(serde::Deserialize)]
+struct HiddenJson {
+    fp_hex: String,
+    profile: String,
+    answer: HiddenAnswer,
+}
+
+/// Hand the console a model update; `kind` is a `PUNKTFUNK_CONSOLE_PUSH_*`. A bad kind or bad
+/// JSON is a logged no-op.
+///
+/// # Safety
+/// `c` is live; `json_text` is a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_push(
+    c: *const PunktfunkConsole,
+    kind: u8,
+    json_text: *const c_char,
+) {
+    guard((), || {
+        // SAFETY: live and NUL-terminated per the contract.
+        let (Some(c), Some(text)) = (unsafe { c.as_ref() }, unsafe { str_arg(json_text) }) else {
+            return;
+        };
+        let (console, library) = (&c.handles.console, &c.handles.library);
+        match kind {
+            PUNKTFUNK_CONSOLE_PUSH_HOSTS => {
+                json::<Vec<HostRow>>(text).map(|v| console.set_hosts(v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_PAIR => json::<PairStatus>(text).map(|v| console.set_pair(v)),
+            PUNKTFUNK_CONSOLE_PUSH_WAKE => {
+                json::<Option<WakeStatus>>(text).map(|v| console.set_wake(v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_NOTICE => json::<String>(text).map(|v| console.set_notice(v)),
+            PUNKTFUNK_CONSOLE_PUSH_SPEED => {
+                json::<SpeedJson>(text).map(|v| console.advance_speed(&v.key, v.phase))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_PROFILES => {
+                json::<ProfilesJson>(text).map(|v| console.set_profiles(&v.fp_hex, v.answer))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_HIDDEN => json::<HiddenJson>(text)
+                .map(|v| console.set_hidden_list(&v.fp_hex, &v.profile, v.answer)),
+            PUNKTFUNK_CONSOLE_PUSH_HIDE => {
+                json::<HideAnswer>(text).map(|v| console.set_hide_answer(v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN => {
+                library.begin_fetch();
+                Some(())
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE => {
+                json::<PhasePush>(text).map(|v| library.set_phase(&v.req, v.phase))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES => {
+                json::<GamesPush>(text).map(|v| library.set_games(&v.req, v.games))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED => {
+                json::<GamesPush>(text).map(|v| library.set_games_cached(&v.req, v.games))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING => {
+                json::<Vec<pf_client_core::library::RunningGame>>(text)
+                    .map(|v| library.set_running(&v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS => json::<pf_console_ui::DownloadsPush>(text)
+                .map(|p| library.set_downloads(&p.downloads, p.grants)),
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE => {
+                json::<u8>(text).map(|v| library.set_stale(bridge::stale_code(v)))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_SETTINGS => json(text).map(|v| c.store.set(v)),
+            PUNKTFUNK_CONSOLE_PUSH_PRESETS => json::<Vec<PresetJson>>(text)
+                .map(|v| c.store.set_presets(v.into_iter().map(Into::into).collect())),
+            PUNKTFUNK_CONSOLE_PUSH_KNOWN_HOSTS => json(text).map(|v| c.store.set_known_hosts(v)),
+            PUNKTFUNK_CONSOLE_PUSH_PADS => json::<PadsJson>(text).map(|mut v| {
+                c.handles.console.set_other_devices(v.take_others());
+                *lock(&c.pads) = v.into_pads();
+            }),
+            PUNKTFUNK_CONSOLE_PUSH_NAVIGATE => {
+                json::<EntryJson>(text).map(|v| *lock(&c.navigate) = Some(v.into_entry()))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_PROMPT => {
+                json::<Prompt>(text).map(|v| *lock(&c.prompt) = Some(v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_LICENSES => {
+                json::<Vec<LicenseSection>>(text).map(|v| c.handles.console.set_licenses(v))
+            }
+            PUNKTFUNK_CONSOLE_PUSH_PAD_TEST => {
+                json::<PadTestState>(text).map(|v| c.handles.console.set_pad_test(v))
+            }
+            _ => {
+                tracing::error!("console: unknown push kind {kind}");
+                None
+            }
+        };
+    })
+}
+
+/// One title's poster, encoded (JPEG/PNG); the shell decodes it at the size it draws.
+///
+/// # Safety
+/// `c` is live; `id` is a NUL-terminated string; `bytes` is `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_art(
+    c: *const PunktfunkConsole,
+    id: *const c_char,
+    bytes: *const u8,
+    len: usize,
+) {
+    guard((), || {
+        // SAFETY: the contract above is `image_args`'.
+        let Some((c, id, bytes)) = (unsafe { image_args(c, id, bytes, len) }) else {
+            return;
+        };
+        c.handles.library.push_art(id.to_string(), bytes);
+    })
+}
+
+/// A profile's picture, encoded, under the URL `ConsoleCmd::FetchAvatar` named.
+///
+/// # Safety
+/// `c` is live; `url` is a NUL-terminated string; `bytes` is `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_avatar(
+    c: *const PunktfunkConsole,
+    url: *const c_char,
+    bytes: *const u8,
+    len: usize,
+) {
+    guard((), || {
+        // SAFETY: the contract above is `image_args`'.
+        let Some((c, url, bytes)) = (unsafe { image_args(c, url, bytes, len) }) else {
+            return;
+        };
+        c.handles.console.set_avatar(url, bytes);
+    })
+}
+
+/// The next event the shell raised, or NULL when there is none: `{"action": OverlayAction}`,
+/// `{"pulse": "move"|"confirm"|"boundary"}`, `{"editing": bool}`, `{"announce": "…"}` or
+/// `{"settings": Settings}` (persist it). Free with `punktfunk_console_string_free`.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_next_event(c: *const PunktfunkConsole) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let event = lock(&c.events).pop_front();
+        event.map_or(std::ptr::null_mut(), |e| out_string(e.to_json()))
+    })
+}
+
+/// Every `ConsoleCmd` queued since the last call, as a JSON array (`[]` when none). Free with
+/// `punktfunk_console_string_free`.
+///
+/// # Safety
+/// `c` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_drain_cmds(c: *const PunktfunkConsole) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        // SAFETY: live per the contract.
+        let Some(c) = (unsafe { c.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let cmds = c.handles.bus.drain();
+        out_string(serde_json::to_string(&cmds).unwrap_or_else(|_| "[]".into()))
+    })
+}
+
+/// The console's background palettes in cycle order, as `[{"id", "name"}]`: what a native
+/// picker offers for `ui_palette`. Free with `punktfunk_console_string_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_console_palettes() -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let list: Vec<_> = (pf_console_ui::palette::PALETTES.iter())
+            .map(|p| serde_json::json!({ "id": p.id, "name": (p.name)() }))
+            .collect();
+        out_string(serde_json::Value::from(list).to_string())
+    })
+}
+
+/// Word the Rust side's text in the first of `languages_json` that Punktfunk ships, a JSON
+/// array of BCP-47 tags, most preferred first. `punktfunk_console_new` does this from its
+/// `languages`; call it first when the palettes or the PyroWave warning are read with no
+/// console. NULL or bad JSON leaves the language as it was.
+///
+/// # Safety
+/// `languages_json` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_set_languages(languages_json: *const c_char) {
+    guard((), || {
+        // SAFETY: NULL or NUL-terminated per this function's contract.
+        if let Some(tags) = unsafe { str_arg(languages_json) }.and_then(json::<Vec<String>>) {
+            pf_l10n::set_languages(&tags);
+        }
+    })
+}
+
+/// Free a string from `punktfunk_console_next_event`, `punktfunk_console_drain_cmds` or
+/// `punktfunk_console_palettes`.
+///
+/// # Safety
+/// `s` is NULL or one of those strings, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_console_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        // SAFETY: from `CString::into_raw` in this module, freed once, per the contract.
+        drop(unsafe { CString::from_raw(s) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::v2::msg::{Zeroizing, UNLOCK_KEY_PROOF};
+
+    fn unlock(kind: u8, secret: &[u8], stay: bool) -> ProfileUnlock {
+        ProfileUnlock::new(kind, Zeroizing::new(secret.to_vec()), stay, 0, Vec::new()).unwrap()
+    }
+
+    /// The palette names the picker offers are messages, read in the thread's language.
+    #[test]
+    fn palette_names_are_worded_from_messages() {
+        let names = |tag: &str| {
+            pf_l10n::with_language(tag, || {
+                let raw = punktfunk_console_palettes();
+                // SAFETY: a NUL-terminated string from `punktfunk_console_palettes`, freed once.
+                let text = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_owned();
+                // SAFETY: as above, and not used again.
+                unsafe { punktfunk_console_string_free(raw) };
+                serde_json::from_str::<Vec<serde_json::Value>>(&text).unwrap()
+            })
+        };
+        let (plain, pseudo) = (names("en"), names("en-XA"));
+        assert!(!plain.is_empty());
+        for (p, x) in plain.iter().zip(&pseudo) {
+            assert_eq!(p["id"], x["id"]);
+            assert!(!p["name"].as_str().unwrap().starts_with('['));
+            assert!(x["name"].as_str().unwrap().starts_with('['));
+        }
+    }
+
+    /// Bad input leaves the language alone; a list it ships is taken.
+    #[test]
+    fn set_languages_takes_a_list_and_ignores_the_rest() {
+        let before = pf_l10n::language();
+        // SAFETY: NULL, or a NUL-terminated literal.
+        unsafe {
+            punktfunk_console_set_languages(std::ptr::null());
+            punktfunk_console_set_languages(c"not json".as_ptr());
+            assert_eq!(pf_l10n::language(), before);
+            punktfunk_console_set_languages(c"[\"en-GB\"]".as_ptr());
+        }
+        assert_eq!(pf_l10n::language(), "en");
+    }
+
+    /// A password that fits goes over with its switch. One that does not fit, a key proof and
+    /// nothing at all leave the buffer and the switch untouched.
+    #[test]
+    fn only_a_password_that_fits_is_handed_over() {
+        let (mut out, mut stay) = ([0u8; 8], false);
+        let fits = Some(unlock(UNLOCK_PASSWORD, b"pw!", true));
+        assert_eq!(hand_over(fits, &mut out, &mut stay), 3);
+        assert_eq!((&out[..4], stay), (&b"pw!\0"[..], true));
+        let (mut small, mut stay) = ([0u8; 2], false);
+        let long = Some(unlock(UNLOCK_PASSWORD, b"pw!", true));
+        assert_eq!(hand_over(long, &mut small, &mut stay), 0);
+        let proof = Some(unlock(UNLOCK_KEY_PROOF, b"sig", false));
+        assert_eq!(hand_over(proof, &mut small, &mut stay), 0);
+        assert_eq!(hand_over(None, &mut small, &mut stay), 0);
+        assert_eq!((small, stay), ([0, 0], false));
+    }
+
+    /// The hide pushes read every bridge sample: a `HiddenAnswer` under its host and profile,
+    /// a `HideAnswer` as it stands.
+    #[test]
+    fn hide_pushes_read_the_bridge_samples() {
+        let raw = include_str!("../../../shared/console-bridge-vectors.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        for answer in doc["models"]["HiddenAnswer"].as_array().unwrap() {
+            let push = serde_json::json!({"fp_hex": "ab12", "profile": "p", "answer": answer});
+            assert!(json::<HiddenJson>(&push.to_string()).is_some(), "{push}");
+        }
+        for answer in doc["models"]["HideAnswer"].as_array().unwrap() {
+            assert!(
+                json::<HideAnswer>(&answer.to_string()).is_some(),
+                "{answer}"
+            );
+        }
+    }
+}

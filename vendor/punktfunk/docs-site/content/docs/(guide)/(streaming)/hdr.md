@@ -1,0 +1,199 @@
+---
+title: HDR
+description: What an HDR10 stream needs from the host, the codec and your client, and how to find the missing link when you get SDR.
+---
+
+You get a 10-bit HDR10 (BT.2020 PQ) stream when every link below holds; otherwise the session
+streams 8-bit SDR. The host reads the settings on this page when you connect, so reconnect after
+changing one. During a session the stream follows the host's picture between HDR and SDR — see
+[Per host](#per-host).
+
+## The chain
+
+1. **The host allows it.** **Host → Video → 10-bit and HDR** (`PUNKTFUNK_10BIT`), on
+   by default.
+2. **The source delivers 10-bit PQ.** This is the link that fails most — see [Per host](#per-host).
+3. **The codec has a 10-bit path:** HEVC, AV1 or [PyroWave](/docs/pyrowave). H.264 has none, so
+   pinning H.264 on the client pins SDR.
+4. **The host GPU encodes 10-bit** for that codec.
+5. **The client asks for HDR** with its HDR setting — see [Per client](#per-client).
+
+## Per host
+
+### Windows
+
+Nothing to set. The host turns HDR on for the session's virtual display when the session is HDR,
+and forces it off for an SDR session; Windows' own **Use HDR** switch doesn't matter.
+
+- The encoder must be NVENC, AMF, QSV or PyroWave. A Windows on Arm host (Media Foundation) or
+  a software-encoding host streams SDR.
+- If Windows refuses to turn HDR on, the host logs an error and streams SDR although the client
+  was told HDR. This is the one case where the client's `HDR` label is wrong.
+- Switching HDR off on the virtual display during a session (**Win+Alt+B** on the host) turns
+  the stream SDR until HDR is back on.
+- On a [Windows seat](/docs/windows-seats), resizing the stream mid-session turns it SDR until
+  the next connect.
+- Vulkan games need the installer's **HDR Vulkan layer** (on by default); see
+  [the troubleshooting entry](#a-vulkan-game-on-windows-says-hdr-isnt-supported).
+
+### Linux + gamescope
+
+The Linux route to HDR on KDE and GNOME, and in Game Mode everywhere. On KDE and GNOME, start the
+game from the client's library: it opens in its own gamescope
+([Dedicated game sessions](/docs/virtual-displays#dedicated-game-sessions), the default). A
+desktop stream stays SDR.
+
+1. Have **`punktfunk-gamescope`**; stock gamescope captures 8-bit. The host packages install it;
+   [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) covers every distro.
+2. Restart the host. It reads what the gamescope build can do once, at startup.
+3. Let the host start the gamescope session, which is the default. A session it attaches to
+   instead streams SDR: clear **Stream this monitor** under **Displays**, and delete any
+   `PUNKTFUNK_GAMESCOPE_ATTACH` line from `host.env`.
+4. For Steam's own HDR setting to be available, the build must be `+pfhdr14` or newer. Check with
+   `punktfunk-gamescope --version`.
+
+The stream is HDR while a game shows HDR and SDR the rest of the time: the Steam UI and SDR
+games stream as SDR, and the picture pauses for a moment when a game turns HDR on or off. The
+Steam UI over a running HDR game stays HDR.
+
+Two kinds of session stay HDR from connect to disconnect instead: one from a client that can't
+switch during a session, and every session on a host that lets devices
+[share one screen](/docs/play-together).
+
+SDR content in an HDR picture (the Steam overlay, or everything in a session that stays HDR)
+starts at **Host → Game Mode → SDR brightness** (advanced, `PUNKTFUNK_GAMESCOPE_SDR_NITS`):
+203 nits, the level the clients expect. Steam's SDR brightness setting moves it during the
+session. Builds older than `+pfhdr16` ignore both and show SDR content oversaturated.
+
+**Game Mode HDR** (`PUNKTFUNK_GAMESCOPE_HDR`) on the same page, turned off, keeps gamescope
+sessions SDR.
+
+A session that follows the switch between Game Mode and the desktop streams SDR on the desktop
+and HDR in Game Mode again, whichever of the two it started in.
+
+### Linux + GNOME
+
+GNOME HDR reaches [Moonlight](/docs/moonlight) only, by mirroring a real monitor (GNOME 50+).
+A Punktfunk app connecting to a GNOME host gets SDR.
+
+1. Add `PUNKTFUNK_VIDEO_SOURCE=portal` to [`host.env`](/docs/configuration) and restart the host.
+2. Put the monitor in HDR mode in GNOME **Settings → Displays**.
+3. Connect with HDR on in Moonlight.
+
+With `PUNKTFUNK_CAPTURE_MONITOR=<connector>` set, only that monitor's HDR mode counts. If no
+monitor is in HDR mode, the session streams SDR and says so in the host log.
+
+### Linux + Hyprland
+
+A virtual display is lit in 10-bit HDR when the client asks for HDR. SDR content inside it
+starts at **SDR brightness** (the Game Mode setting, 203 nits). A Hyprland too old to light it
+in HDR streams SDR until the host restarts.
+
+HDR needs Hyprland's colour management, which is on by default. With `render:cm_enabled = false`
+the session streams SDR.
+
+**Streaming a physical monitor** on Hyprland is HDR when that monitor is in HDR mode. Nothing
+to set on the host.
+
+### Other Linux desktops
+
+SDR. KDE and GNOME's virtual displays capture 8-bit, and so does streaming a physical monitor
+on KDE to a Punktfunk app. No setting changes this.
+
+On Sway and scroll, streaming a physical monitor is HDR when that monitor is in HDR mode, as on
+Hyprland. Their virtual displays are SDR.
+
+## Per client
+
+The setting is **10-bit HDR**, **on by default** in every client, and can differ per
+[preset](/docs/presets-and-links). It sits with the other
+[video settings](/docs/client-settings#video).
+
+| Client | Asks for HDR when |
+|---|---|
+| Linux, Steam Deck | the setting is on. Shows HDR10 where the display offers it, otherwise tone-maps to SDR |
+| Windows | the setting is on **and** Windows HDR is on for the monitor the stream window is on |
+| macOS, iPhone, iPad | the setting is on **and** the display is HDR-capable |
+| Apple TV | the setting is on **and** the TV is HDR-capable. The TV switches to HDR10 only with tvOS **Match Content** on; otherwise the stream is tone-mapped to SDR |
+| Android, Android TV | the setting is on. It is greyed out on a panel without HDR10. Where Android reports no extra brightness for HDR, it starts off and asks once before it turns on: the whole picture is dimmed to fit the highlights in, and may look darker than SDR |
+| Moonlight | its own HDR toggle is on. The toggle appears when the host offers a 10-bit codec |
+
+## 10-bit SDR
+
+The client's **10-bit SDR** setting asks for a 10-bit stream without HDR.
+
+A Windows 11 24H2 (or later) host composes the virtual display in wide colour for that session,
+at some GPU cost, and Windows shows it as a 10-bit display. A gamescope session on
+`punktfunk-gamescope` `+pfhdr26` or newer captures 10-bit SDR too. The stream then carries the
+desktop's own bits past 8, wherever a game or app renders them.
+
+Other desktops hand the host only 8 bits of SDR, so the host could only widen each frame:
+smoother gradients after the encoder, one more colour pass on the GPU, no detail the desktop
+didn't have. There the host streams 8-bit SDR unless **Host → Video → Allow 10-bit
+SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`, advanced, off by default) is on.
+
+## HDR and 4:4:4
+
+[Full chroma](/docs/client-settings#video) and HDR work together on Windows and Linux hosts,
+with HEVC or PyroWave. AV1 is always 4:2:0.
+
+## HDR on a shared screen
+
+Devices that [share one screen](/docs/play-together) share its HDR or SDR too. A device that joins
+a screen in HDR must ask for HDR ([Per client](#per-client)), or it is told it can't join. A screen
+in SDR streams SDR to every device, an HDR TV included.
+
+## Check it
+
+**On the client**, set the [stats overlay](/docs/stats) to **Detailed**. Its first line names the
+codec and depth, then `HDR` for an HDR stream on an HDR display, or `HDR→SDR` when the Linux or
+Windows client tone-maps it because the display offers no HDR10.
+
+**On a Linux host**, one command checks every link:
+
+```bash
+punktfunk-host hdr-probe
+```
+
+It reports the monitor's HDR mode, whether the gamescope build offers 10-bit capture, the Game
+Mode HDR setting, the encoder's 10-bit answer for HEVC and AV1, and whether the resolved compositor
+and the GameStream side can do HDR. The service reads `host.env` and your shell doesn't, so load it
+first, or the answers describe your shell:
+
+```bash
+set -a; . ~/.config/punktfunk/host.env; set +a
+punktfunk-host hdr-probe
+```
+
+On Windows, [`hdr-p010-selftest`](/docs/host-cli#hdr-probe-and-probe-compositor) checks the GPU's
+HDR colour conversion instead.
+
+## Troubleshooting
+
+### The stream is SDR
+
+The host logs an `encode bit depth` line per session, and again each time the stream switches.
+`display_hdr=true` with `content_hdr=Some(false)` is a gamescope session with no game showing
+HDR: nothing is missing. Otherwise the first `false` among `host_wants_10bit`,
+`capture_supports_hdr`, `client_wants_hdr` and `gpu_can_10bit` names the missing link of
+[the chain](#the-chain): the host setting, the source, the client, or the codec and GPU.
+
+### HDR stopped working on a Linux host
+
+The log says `HDR capture negotiation failed`. After that the host offers SDR: on gamescope until
+that display closes, on the GNOME monitor mirror until the host restarts. Fix the cause (usually
+a gamescope that isn't the Punktfunk build, or a monitor out of HDR mode), then reconnect or
+restart.
+
+### A Vulkan game on Windows says HDR isn't supported
+
+NVIDIA and AMD Vulkan drivers hide HDR from games on a virtual display. The installer's **HDR
+Vulkan layer** option (`VK_LAYER_PUNKTFUNK_hdr_inject`) shows it to them again; re-run the
+installer with it ticked. The layer does nothing in an SDR session or on a physical monitor, and
+skips a built-in list of anti-cheat titles. To turn it off for one game, set `DISABLE_PF_VKHDR=1` in its environment, or
+list executables in `PF_VKHDR_EXCLUDE=foo.exe,bar.exe`. D3D11 and D3D12 games don't need it.
+
+### An HDR stream is green on a Windows client with an AMD GPU
+
+AMD drivers older than AMD Software 25.9.1 draw HDR wrong on the Vulkan decoder; the client warns
+about it. Update the driver, or set **Video decoder** to **Direct3D 11**.

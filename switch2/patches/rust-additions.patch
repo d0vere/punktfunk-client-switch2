@@ -1,0 +1,911 @@
+diff --git a/crates/pf-nx-switch2-platform/Cargo.toml b/crates/pf-nx-switch2-platform/Cargo.toml
+new file mode 100644
+index 0000000..c23df05
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/Cargo.toml
+@@ -0,0 +1,20 @@
++[package]
++name = "pf-nx-switch2-platform"
++version = "1.1.0"
++description = "Native libounce/OunceVK platform backend for the official Punktfunk Switch client"
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++repository.workspace = true
++publish = false
++
++[dependencies]
++anyhow.workspace = true
++tracing.workspace = true
++skia-safe.workspace = true
++punktfunk-core.workspace = true
++pf-nx-app = { path = "../pf-nx-app" }
++pf-nx-sys = { path = "../pf-nx-sys", default-features = false }
++
++[lints]
++workspace = true
+diff --git a/crates/pf-nx-switch2-platform/build.rs b/crates/pf-nx-switch2-platform/build.rs
+new file mode 100644
+index 0000000..656f0e6
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/build.rs
+@@ -0,0 +1,33 @@
++//! Native code is compiled with ounce-devkit by tooling/build_native.sh.
++//! This step LINKS its actual library into the official Rust title. No native
++//! dependencies are downloaded or injected into global Cargo caches.
++use std::env;
++use std::path::PathBuf;
++fn main() {
++    println!("cargo:rerun-if-env-changed=PF2_NATIVE_LIB_DIR");
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("horizon") { return; }
++    let dir = PathBuf::from(env::var("PF2_NATIVE_LIB_DIR")
++        .expect("PF2_NATIVE_LIB_DIR must name the freshly built Switch 2 native library"));
++    assert!(dir.join("libpf2native.a").is_file(), "missing freshly compiled libpf2native.a");
++    let sdk = PathBuf::from(env::var("DEVKITPRO").unwrap_or_else(|_| "/opt/devkitpro".into()));
++    assert!(sdk.join("libounce/include/switch2/video/decoder.h").is_file(),
++            "libounce Switch2 VideoDecoder SDK header missing");
++    println!("cargo:rustc-link-search=native={}", dir.display());
++    for d in ["libounce/lib", "portlibs/switch2/lib", "portlibs/switch/lib",
++              "devkitA64/aarch64-none-elf/lib/pic"] {
++        println!("cargo:rustc-link-search=native={}", sdk.join(d).display());
++    }
++    if let Ok(entries) = std::fs::read_dir(sdk.join("devkitA64/lib/gcc/aarch64-none-elf")) {
++        for entry in entries.flatten() {
++            let pic = entry.path().join("pic");
++            if pic.is_dir() { println!("cargo:rustc-link-search=native={}", pic.display()); }
++        }
++    }
++    println!("cargo:rustc-link-lib=static=pf2native");
++    // OunceVK provides libvulkan; libounce is a libnx-compatible libnx.a.
++    println!("cargo:rustc-link-lib=vulkan");
++    println!("cargo:rustc-link-lib=nx");
++    for lib in ["stdc++", "sysbase", "c", "m", "gcc"] {
++        println!("cargo:rustc-link-lib={lib}");
++    }
++}
+diff --git a/crates/pf-nx-switch2-platform/src/audio.rs b/crates/pf-nx-switch2-platform/src/audio.rs
+new file mode 100644
+index 0000000..1157650
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/audio.rs
+@@ -0,0 +1,41 @@
++//! Real PCM 48 kHz stereo output through libounce. The official application's
++//! audio jitter buffer and PCM Opus decoding remain unchanged.
++use std::ptr;
++use anyhow::{ensure, Result};
++use pf_nx_app::platform::{AudioOut, AudioPort};
++use crate::ffi;
++
++pub(crate) struct NativeAudio;
++struct Port { handle: *mut ffi::Handle }
++// The owner is transferred to the official audio writer's sole thread.
++unsafe impl Send for Port {}
++
++const GRAIN: usize = 256;
++
++impl AudioOut for NativeAudio {
++    fn open(&self, channels: u8, rate: u32) -> Result<Box<dyn AudioPort>> {
++        ensure!(channels == 2 && rate == 48_000,
++                "native audout is 48 kHz stereo, requested {rate} Hz and {channels} channels");
++        let mut handle = ptr::null_mut();
++        // SAFETY: out pointer is valid; C owns the service until Port is dropped.
++        ffi::check("audoutInitialize", unsafe { ffi::pf2_audio_open(&mut handle, rate, u32::from(channels)) })?;
++        ensure!(!handle.is_null(), "native audio returned null");
++        Ok(Box::new(Port { handle }))
++    }
++}
++
++impl AudioPort for Port {
++    fn grain_frames(&self) -> usize { GRAIN }
++    fn write(&mut self, pcm: &[f32]) -> Result<()> {
++        ensure!(pcm.len() == GRAIN * 2, "PCM grain shape mismatch");
++        // SAFETY: Port solely owns the audio handle, PCM slice outlives the blocking call.
++        ffi::check("audoutPlayBuffer", unsafe { ffi::pf2_audio_write(self.handle, pcm.as_ptr(), GRAIN) })
++    }
++}
++
++impl Drop for Port {
++    fn drop(&mut self) {
++        // SAFETY: the official app stopped the writer before dropping the port.
++        unsafe { ffi::pf2_audio_close(self.handle) };
++    }
++}
+diff --git a/crates/pf-nx-switch2-platform/src/display.rs b/crates/pf-nx-switch2-platform/src/display.rs
+new file mode 100644
+index 0000000..9c13ad8
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/display.rs
+@@ -0,0 +1,274 @@
++//! Live official UI + decoded video composition. Skia rasterizes the official UI;
++//! the resulting real RGBA frame is transferred to the OunceVK swapchain by C.
++//! CPU Skia is an intermediate implementation, NOT Skia/Ganesh on the GPU.
++use std::ptr;
++use std::sync::{Arc, Mutex};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
++
++use anyhow::{anyhow, Context, Result};
++use pf_nx_app::platform::{Display, Fit, FrameReport, OperationMode, Refresh, Rgba, VideoE2e};
++use skia_safe::{AlphaType, Color, ColorType, ImageInfo};
++
++use crate::ffi;
++
++pub(crate) struct VideoPicture {
++    pub(crate) width: u32,
++    pub(crate) height: u32,
++    pub(crate) rgba: Vec<u8>,
++    pub(crate) capture_pts_ns: u64,
++    pub(crate) decoded_at: Instant,
++    pub(crate) video_e2e: VideoE2e,
++}
++
++#[derive(Default)]
++pub(crate) struct VideoSlot {
++    pub(crate) frame: Mutex<Option<VideoPicture>>,
++}
++
++/// Offscreen raster surface composited with decoded video over the same display.
++pub struct NativeDisplay {
++    presenter: *mut ffi::Handle,
++    surface: skia_safe::Surface,
++    size: (u32, u32),
++    ui_enabled: bool,
++    stream_enabled: bool,
++    fit: Fit,
++    video: Arc<VideoSlot>,
++    current: Option<VideoPicture>,
++    pixels: Vec<u8>,
++    docked: bool,
++    mode: Arc<AtomicBool>,
++    frame_number: u64,
++}
++
++impl NativeDisplay {
++    pub(crate) fn new(video: Arc<VideoSlot>, mode: Arc<AtomicBool>) -> Result<Self> {
++        let docked = mode.load(Ordering::Acquire);
++        let (presenter, size) = Self::open_presenter(docked)?;
++        let surface = match Self::raster(size) {
++            Ok(s) => s,
++            Err(e) => {
++                // SAFETY: presenter is owned by this constructor and not shared.
++                unsafe { ffi::pf2_presenter_close(presenter) };
++                return Err(e);
++            }
++        };
++        let mut pixels = vec![0; size.0 as usize * size.1 as usize * 4];
++        // Diagnostic boot frame before the official app's font loading, QUIC
++        // discovery or menu warm-up. Visible BLUE/GREEN = swapchain scanout works;
++        // black even here = investigate OunceVK/VI window routing first.
++        for (y, line) in pixels.chunks_exact_mut(size.0 as usize * 4).enumerate() {
++            for (x, px) in line.chunks_exact_mut(4).enumerate() {
++                let green = x >= size.0 as usize / 2;
++                px.copy_from_slice(if green { &[0, 220, 90, 255] } else { &[36, 80, 240, 255] });
++                if y < 64 && x < 64 { px.copy_from_slice(&[250, 250, 250, 255]); }
++            }
++        }
++        // SAFETY: native call consumes pixels synchronously; presenter owns the swapchain.
++        let boot_rc = unsafe { ffi::pf2_presenter_frame(presenter, pixels.as_ptr(), pixels.len(), size.0 as usize * 4) };
++        if boot_rc != ffi::OK {
++            unsafe { ffi::pf2_presenter_close(presenter) };
++            anyhow::bail!("OunceVK diagnostic boot frame: rc={boot_rc}");
++        }
++        println!("switch2: diagnostic boot frame submitted {}x{} (blue/green)", size.0, size.1);
++        // Hold the diagnostic image long enough to observe it; only this
++        // diagnostic build incurs the 1.5 second cold-start pause.
++        std::thread::sleep(std::time::Duration::from_millis(1500));
++        Ok(Self { presenter, surface, size, ui_enabled: true,
++            stream_enabled: false, fit: Fit::Contain, video,
++            current: None, pixels, docked, mode, frame_number: 0 })
++    }
++
++    fn raster(size: (u32, u32)) -> Result<skia_safe::Surface> {
++        let info = ImageInfo::new(
++            (size.0 as i32, size.1 as i32), ColorType::RGBA8888, AlphaType::Premul, None);
++        skia_safe::surfaces::raster(&info, None, None).ok_or_else(|| anyhow!("Skia raster allocation"))
++    }
++
++    fn open_presenter(docked: bool) -> Result<(*mut ffi::Handle, (u32, u32))> {
++        let (w, h) = if docked { (1920, 1080) } else { (1280, 720) };
++        let mut presenter = ptr::null_mut();
++        // SAFETY: out pointer writable and ownership transferred on successful return.
++        ffi::check("OunceVK presenter", unsafe { ffi::pf2_presenter_open(&mut presenter, w, h) })?;
++        if presenter.is_null() { anyhow::bail!("presenter opened without a handle") }
++        let (mut pw, mut ph) = (0, 0);
++        // SAFETY: presenter is live, out values writable.
++        let rc = unsafe { ffi::pf2_presenter_size(presenter, &mut pw, &mut ph) };
++        if rc != ffi::OK || pw == 0 || ph == 0 || pw > 3840 || ph > 2160 {
++            // SAFETY: only constructor owns this pointer here.
++            unsafe { ffi::pf2_presenter_close(presenter) };
++            anyhow::bail!("OunceVK swapchain extent: rc={rc} {pw}x{ph}");
++        }
++        Ok((presenter, (pw, ph)))
++    }
++
++    fn rebuild(&mut self, docked: bool) -> Result<()> {
++        let (new_presenter, new_size) = Self::open_presenter(docked)?;
++        let new_surface = match Self::raster(new_size) {
++            Ok(s) => s,
++            Err(e) => {
++                // SAFETY: this is a new, not yet published presenter.
++                unsafe { ffi::pf2_presenter_close(new_presenter) };
++                return Err(e);
++            }
++        };
++        // SAFETY: the old device has no GPU work in flight after frame returns.
++        unsafe { ffi::pf2_presenter_close(self.presenter) };
++        self.presenter = new_presenter;
++        self.surface = new_surface;
++        self.size = new_size;
++        self.pixels.resize(new_size.0 as usize * new_size.1 as usize * 4, 0);
++        self.docked = docked;
++        Ok(())
++    }
++
++    fn compose(&mut self, ui: &mut dyn FnMut(&skia_safe::Canvas)) -> Result<bool> {
++        let mut fresh = false;
++        if self.stream_enabled {
++            if let Some(frame) = self.video.frame.lock().map_err(|_| anyhow!("poisoned video slot"))?.take() {
++                self.current = Some(frame);
++                fresh = true;
++            }
++        } else {
++            self.current = None;
++            // Do not retain last session's pictures or consume new ones while hidden.
++            let _ = self.video.frame.lock().map_err(|_| anyhow!("poisoned video slot"))?.take();
++        }
++        self.pixels.fill(0);
++        for pixel in self.pixels.chunks_exact_mut(4) { pixel[3] = 255; }
++        if self.stream_enabled {
++            if let Some(picture) = &self.current {
++                scale_video(picture, self.size, self.fit, &mut self.pixels);
++            }
++        }
++        if self.ui_enabled {
++            let canvas = self.surface.canvas();
++            canvas.clear(Color::TRANSPARENT);
++            ui(canvas);
++            let pixmap = self.surface.peek_pixels().context("Skia UI pixels")?;
++            let source = pixmap.bytes().context("Skia UI raster bytes")?;
++            if self.frame_number < 3 || self.frame_number == 120 {
++                // 1/64 pixel subsampling keeps this cheap at docked resolution.
++                let mut nonempty_alpha = 0usize;
++                let mut nonblack_rgb = 0usize;
++                let mut total = 0usize;
++                for row in source.chunks(pixmap.row_bytes()).take(self.size.1 as usize).step_by(8) {
++                    for pixel in row.chunks_exact(4).take(self.size.0 as usize).step_by(8) {
++                        total += 1;
++                        if pixel[3] != 0 { nonempty_alpha += 1; }
++                        if pixel[..3].iter().any(|&c| c != 0) { nonblack_rgb += 1; }
++                    }
++                }
++                tracing::info!("switch2 skia ui: frame={} nonzero-alpha={nonempty_alpha}/{total} nonblack-rgb={nonblack_rgb}/{total} extent={}x{}",
++                    self.frame_number + 1, self.size.0, self.size.1);
++            }
++            blend_ui(&mut self.pixels, source, self.size.0 as usize,
++                     self.size.1 as usize, pixmap.row_bytes());
++        }
++        Ok(fresh)
++    }
++}
++
++impl Display for NativeDisplay {
++    fn size(&self) -> (u32, u32) { self.size }
++    fn refresh(&self) -> Refresh { Refresh(60_000) }
++    fn mode(&self) -> OperationMode {
++        if self.mode.load(Ordering::Acquire) { OperationMode::Docked } else { OperationMode::Handheld }
++    }
++    fn frame(&mut self, ui: &mut dyn FnMut(&skia_safe::Canvas)) -> Result<FrameReport> {
++        let mode = self.mode.load(Ordering::Acquire);
++        if mode != self.docked { self.rebuild(mode)?; }
++        let fresh = self.compose(ui)?;
++        let row = self.size.0 as usize * 4;
++        // SAFETY: pixels stay allocated until the synchronous presenter call completes.
++        let mut rc = unsafe { ffi::pf2_presenter_frame(self.presenter,
++            self.pixels.as_ptr(), self.pixels.len(), row) };
++        if rc == ffi::OUT_OF_DATE {
++            self.rebuild(self.docked)?;
++            self.compose(ui)?;
++            let row = self.size.0 as usize * 4;
++            // SAFETY: ownership unchanged; freshly created swapchain and sized pixels.
++            rc = unsafe { ffi::pf2_presenter_frame(self.presenter,
++                self.pixels.as_ptr(), self.pixels.len(), row) };
++        }
++        ffi::check("OunceVK present", rc)?;
++        self.frame_number = self.frame_number.saturating_add(1);
++        if self.frame_number <= 3 || self.frame_number == 120 {
++            tracing::info!("switch2 present: frame={} rc={rc} {}x{} video={} ui={}",
++                self.frame_number, self.size.0, self.size.1,
++                self.stream_enabled, self.ui_enabled);
++        }
++        if fresh {
++            if let Some(picture) = &self.current {
++                if picture.capture_pts_ns > 0 {
++                    if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
++                        picture.video_e2e.note(picture.capture_pts_ns, now.as_nanos() as u64);
++                    }
++                }
++            }
++        }
++        let elapsed = self.current.as_ref()
++            .filter(|_| fresh).map(|f| f.decoded_at.elapsed().as_micros().min(u128::from(u32::MAX)) as u32);
++        Ok(FrameReport { new_picture: fresh, decode_to_present_us: elapsed, ..Default::default() })
++    }
++    fn set_stream(&mut self, on: bool, fit: Fit) { self.stream_enabled = on; self.fit = fit; }
++    fn set_ui_layer(&mut self, on: bool) { self.ui_enabled = on; }
++    fn read_back(&mut self) -> Result<Option<Rgba>> {
++        Ok(Some(Rgba { width: self.size.0, height: self.size.1, pixels: self.pixels.clone() }))
++    }
++}
++
++impl Drop for NativeDisplay {
++    fn drop(&mut self) {
++        // SAFETY: display exclusively owns the presenter pointer.
++        unsafe { ffi::pf2_presenter_close(self.presenter) };
++    }
++}
++
++/// Scale the newest decoded frame to a pixel buffer, respecting aspect-ratio policy.
++/// All image and slice dimensions were validated on construction.
++fn scale_video(src: &VideoPicture, dst: (u32, u32), fit: Fit, out: &mut [u8]) {
++    let (w, h) = (dst.0 as usize, dst.1 as usize);
++    let (sw, sh) = (src.width as usize, src.height as usize);
++    if sw == 0 || sh == 0 || src.rgba.len() < sw.saturating_mul(sh).saturating_mul(4) { return; }
++    let (sx, sy) = match fit {
++        Fit::Stretch => (w as f64 / sw as f64, h as f64 / sh as f64),
++        Fit::Contain => {
++            let scale = (w as f64 / sw as f64).min(h as f64 / sh as f64);
++            (scale, scale)
++        }
++        Fit::Cover => {
++            let scale = (w as f64 / sw as f64).max(h as f64 / sh as f64);
++            (scale, scale)
++        }
++    };
++    let ox = (w as f64 - sw as f64 * sx) * 0.5;
++    let oy = (h as f64 - sh as f64 * sy) * 0.5;
++    for y in 0..h {
++        let fy = ((y as f64 - oy) / sy).floor();
++        if !(0.0..sh as f64).contains(&fy) { continue; }
++        for x in 0..w {
++            let fx = ((x as f64 - ox) / sx).floor();
++            if !(0.0..sw as f64).contains(&fx) { continue; }
++            let from = (fy as usize * sw + fx as usize) * 4;
++            let to = (y * w + x) * 4;
++            out[to..to + 4].copy_from_slice(&src.rgba[from..from + 4]);
++        }
++    }
++}
++
++/// Skia RGBA8888 is premultiplied; the video beneath is opaque RGBA.
++fn blend_ui(dst: &mut [u8], src: &[u8], w: usize, h: usize, stride: usize) {
++    for y in 0..h {
++        for x in 0..w {
++            let d = (y * w + x) * 4;
++            let s = y * stride + x * 4;
++            let a = u32::from(src[s + 3]);
++            for c in 0..3 {
++                dst[d + c] = (u32::from(src[s + c]) +
++                    u32::from(dst[d + c]) * (255 - a) / 255).min(255) as u8;
++            }
++        }
++    }
++}
+diff --git a/crates/pf-nx-switch2-platform/src/ffi.rs b/crates/pf-nx-switch2-platform/src/ffi.rs
+new file mode 100644
+index 0000000..7e8da60
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/ffi.rs
+@@ -0,0 +1,89 @@
++//! FFI with ports/switch2/native/pf2_native.h; all pointer ownership is wrapped
++//! by RAII types in sibling modules. This module intentionally has no assumptions
++//! about libnx v1 struct sizes: pointers are opaque, data layouts are fixed-width.
++use core::ffi::c_void;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++pub struct Frame {
++    pub width: u32,
++    pub height: u32,
++    pub pitch_y: u32,
++    pub pitch_uv: u32,
++    pub pts_ns: u64,
++    pub plane_y: *const u8,
++    pub plane_uv: *const u8,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct DecoderSettings {
++    pub width: u32,
++    pub height: u32,
++    pub fps: u32,
++    pub codec: u32,
++    pub image_count: u32,
++    pub codec_data: *const u8,
++    pub codec_data_length: usize,
++    pub max_sample_bytes: u64,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++pub struct PadRaw {
++    pub slot: u32,
++    pub connected: u32,
++    pub handheld: u32,
++    pub buttons: u64,
++    pub left_x: i32,
++    pub left_y: i32,
++    pub right_x: i32,
++    pub right_y: i32,
++}
++
++pub type Handle = c_void;
++
++pub const OK: i32 = 0;
++pub const NOT_READY: i32 = -4;
++pub const OUT_OF_DATE: i32 = -6;
++
++#[link(name = "pf2native", kind = "static")]
++unsafe extern "C" {
++    pub fn pf2_decoder_open(out: *mut *mut Handle, s: *const DecoderSettings) -> i32;
++    pub fn pf2_decoder_submit(d: *mut Handle, data: *const u8, len: usize, pts_ns: i64, timeout_ns: u64) -> i32;
++    pub fn pf2_decoder_acquire(d: *mut Handle, frame: *mut Frame, timeout_ns: u64) -> i32;
++    pub fn pf2_decoder_release(d: *mut Handle) -> i32;
++    pub fn pf2_decoder_flush(d: *mut Handle) -> i32;
++    pub fn pf2_decoder_close(d: *mut Handle);
++    pub fn pf2_decoder_last_sdk_result(d: *const Handle) -> u32;
++    pub fn pf2_h264_config_from_annexb(au: *const u8, len: usize, output: *mut u8, cap: usize, written: *mut usize) -> i32;
++    pub fn pf2_nv12_rgba(y: *const u8, y_len: usize, y_stride: usize,
++        uv: *const u8, uv_len: usize, uv_stride: usize, width: u32, height: u32,
++        rgba: *mut u8, rgba_len: usize, rgba_stride: usize, matrix: i32, full_range: i32) -> i32;
++    pub fn pf2_presenter_open(out: *mut *mut Handle, width: u32, height: u32) -> i32;
++    pub fn pf2_presenter_size(p: *const Handle, width: *mut u32, height: *mut u32) -> i32;
++    pub fn pf2_presenter_frame(p: *mut Handle, rgba: *const u8, bytes: usize, stride: usize) -> i32;
++    pub fn pf2_presenter_close(p: *mut Handle);
++    pub fn pf2_audio_open(out: *mut *mut Handle, rate: u32, channels: u32) -> i32;
++    pub fn pf2_audio_write(a: *mut Handle, pcm: *const f32, frames: usize) -> i32;
++    pub fn pf2_audio_close(a: *mut Handle);
++    pub fn pf2_input_open(out: *mut *mut Handle) -> i32;
++    pub fn pf2_input_poll(input: *mut Handle, samples: *mut PadRaw) -> i32;
++    pub fn pf2_input_close(input: *mut Handle);
++    pub fn pf2_input_rumble(input: *mut Handle, slot: u32, low: u16, high: u16) -> i32;
++    pub fn pf2_input_release_all(input: *mut Handle);
++    pub fn pf2_skia_compat_link_guard();
++    pub fn pf2_runtime_open(out: *mut *mut Handle) -> i32;
++    pub fn pf2_runtime_poll(r: *mut Handle, flags: *mut u32, docked: *mut u32) -> i32;
++    pub fn pf2_runtime_docked(r: *const Handle) -> u32;
++    pub fn pf2_runtime_applet(r: *const Handle) -> u32;
++    pub fn pf2_runtime_close(r: *mut Handle);
++}
++
++pub fn check(what: &str, rc: i32) -> anyhow::Result<()> {
++    if rc == OK { Ok(()) } else { anyhow::bail!("{what}: libounce bridge returned {rc}") }
++}
++
++const _: [(); 48] = [(); std::mem::size_of::<DecoderSettings>()];
++const _: [(); 40] = [(); std::mem::size_of::<Frame>()];
++const _: [(); 40] = [(); std::mem::size_of::<PadRaw>()];
+diff --git a/crates/pf-nx-switch2-platform/src/input.rs b/crates/pf-nx-switch2-platform/src/input.rs
+new file mode 100644
+index 0000000..aade724
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/input.rs
+@@ -0,0 +1,68 @@
++//! Original libounce Switch 2 HID sample source, using the official
++//! pf-nx-platform pad-map verbatim via relative module import.
++use std::ptr;
++use anyhow::Result;
++use pf_nx_app::platform::{PadFeedback, PadKind, PadSample, Pads};
++use crate::{ffi, pad_map};
++
++pub(crate) struct NativePads { handle: *mut ffi::Handle }
++// Input is owned and called by the application's input thread, not shared.
++unsafe impl Send for NativePads {}
++
++impl NativePads {
++    pub(crate) fn new() -> Result<Self> {
++        let mut handle = ptr::null_mut();
++        // SAFETY: valid writable out-pointer.
++        ffi::check("padConfigureInput", unsafe { ffi::pf2_input_open(&mut handle) })?;
++        anyhow::ensure!(!handle.is_null(), "libounce returned a null HID object");
++        Ok(Self { handle })
++    }
++}
++
++impl Pads for NativePads {
++    fn poll(&mut self, out: &mut Vec<PadSample>) {
++        out.clear();
++        let mut samples = [ffi::PadRaw::default(); 4];
++        // SAFETY: raw samples is exactly four repr(C) structs; exclusively owned handle.
++        let rc = unsafe { ffi::pf2_input_poll(self.handle, samples.as_mut_ptr()) };
++        if rc != ffi::OK {
++            tracing::warn!("Switch 2 HID poll failed: {rc}");
++            return;
++        }
++        for raw in samples {
++            if raw.connected == 0 { continue; }
++            let (lt, rt) = pad_map::triggers(raw.buttons);
++            out.push(PadSample {
++                slot: raw.slot as u8,
++                kind: if raw.handheld != 0 { PadKind::JoyConPair } else { PadKind::Other },
++                buttons: pad_map::buttons(raw.buttons),
++                lx: pad_map::stick(raw.left_x),
++                ly: pad_map::stick(raw.left_y),
++                rx: pad_map::stick(raw.right_x),
++                ry: pad_map::stick(raw.right_y),
++                lt, rt,
++            });
++        }
++    }
++
++    fn feedback(&mut self, slot: u8, feedback: &PadFeedback) {
++        let PadFeedback::Rumble { low, high } = *feedback;
++        // SAFETY: controlled input pointer, valid slot checked in C.
++        let rc = unsafe { ffi::pf2_input_rumble(self.handle, u32::from(slot), low, high) };
++        if rc != ffi::OK && rc != ffi::NOT_READY {
++            tracing::debug!("HD rumble unavailable for slot {slot}: {rc}");
++        }
++    }
++
++    fn release_all(&mut self) {
++        // SAFETY: exclusive ownership of this HID device.
++        unsafe { ffi::pf2_input_release_all(self.handle) };
++    }
++}
++
++impl Drop for NativePads {
++    fn drop(&mut self) {
++        // SAFETY: unique owning handle. This also stops motors before freeing.
++        unsafe { ffi::pf2_input_close(self.handle) };
++    }
++}
+diff --git a/crates/pf-nx-switch2-platform/src/lib.rs b/crates/pf-nx-switch2-platform/src/lib.rs
+new file mode 100644
+index 0000000..5508b50
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/lib.rs
+@@ -0,0 +1,146 @@
++//! Switch 2 implementation of the official pf-nx-app::platform seams.
++//! Keeps pf-nx-app, Punktfunk QUIC, pairing, settings and core untouched except
++//! for the AV1 capability extension. Does NOT import a foreign frontend.
++#![cfg(target_os = "horizon")]
++
++use std::cell::{Cell, OnceCell};
++use std::time::Instant;
++use std::path::{Path, PathBuf};
++use std::ptr;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
++use anyhow::{Result, ensure};
++use pf_nx_app::platform::{
++    DeviceInfo, Lifecycle, OperationMode, Platform, Storage, SystemEvent,
++};
++
++mod audio;
++mod display;
++mod ffi;
++mod input;
++mod video;
++// Reuse the official input-to-wire mapping from this exact pinned checkout.
++#[path = "../../pf-nx-platform/src/pad_map.rs"]
++mod pad_map;
++
++const DATA_DIR: &str = "sdmc:/switch/punktfunk";
++struct Dir(PathBuf);
++impl Storage for Dir { fn data_dir(&self) -> &Path { &self.0 } }
++
++struct NativeLifecycle {
++    handle: Cell<*mut ffi::Handle>,
++    docked: Arc<AtomicBool>,
++    closing: bool,
++    // System font mapping is owned by pl:u until userAppExit; one load per title.
++    fonts: OnceCell<Vec<&'static [u8]>>,
++}
++
++impl NativeLifecycle {
++    fn new(docked: Arc<AtomicBool>) -> Result<Self> {
++        let mut handle = ptr::null_mut();
++        // SAFETY: writable out-pointer; libounce creates and owns BSD socket services.
++        ffi::check("socketInitializeDefault / appletLockExit", unsafe { ffi::pf2_runtime_open(&mut handle) })?;
++        ensure!(!handle.is_null(), "socket runtime initialized without a handle");
++        docked.store(unsafe { ffi::pf2_runtime_docked(handle) } != 0, Ordering::Release);
++        Ok(Self { handle: Cell::new(handle), docked, closing: false, fonts: OnceCell::new() })
++    }
++
++    fn release(&self) {
++        let handle = self.handle.replace(ptr::null_mut());
++        if !handle.is_null() {
++            // SAFETY: only NativeLifecycle owns this process-wide socket runtime.
++            unsafe { ffi::pf2_runtime_close(handle) };
++        }
++    }
++}
++
++impl Lifecycle for NativeLifecycle {
++    fn hide_splash(&self) {}
++
++    // The official Switch 1 client asks pl:u for system faces. On Switch 2
++    // the previous port used Lifecycle's empty default, leaving Skia with zero
++    // system faces and no guaranteed text font. libounce exposes the same pl:u
++    // ABI and pf-nx-sys already owns the validated font loader and exit hook.
++    fn fallback_fonts(&self) -> &[&'static [u8]] {
++        self.fonts.get_or_init(|| {
++            let begin = Instant::now();
++            let faces = pf_nx_sys::pl::shared_fonts("en");
++            let bytes: usize = faces.iter().map(|f| f.len()).sum();
++            tracing::info!(
++                "switch2 fonts: {} shared faces, {} bytes, loaded in {} ms",
++                faces.len(), bytes, begin.elapsed().as_millis()
++            );
++            faces
++        })
++    }
++
++
++    fn poll_events(&mut self, out: &mut Vec<SystemEvent>) {
++        if self.closing { self.exit(); }
++        let mut flags = 0;
++        let mut docked = 0;
++        // SAFETY: unique owner; polling on the app's main thread.
++        let rc = unsafe { ffi::pf2_runtime_poll(self.handle.get(), &mut flags, &mut docked) };
++        if rc != ffi::OK {
++            tracing::error!("Switch 2 applet pump failed: {rc}");
++            out.push(SystemEvent::Suspend);
++            self.closing = true;
++            return;
++        }
++        let new_mode = docked != 0;
++        let old_mode = self.docked.swap(new_mode, Ordering::AcqRel);
++        if flags & 1 != 0 { out.push(SystemEvent::FocusLost); }
++        if flags & 2 != 0 { out.push(SystemEvent::FocusGained); }
++        if flags & 4 != 0 {
++            out.push(SystemEvent::Suspend);
++            // The first suspension may be just HOME, not exit. Only exit
++            // requests should close the title; C flag 32 marks a real close.
++        }
++        if flags & 8 != 0 { out.push(SystemEvent::Resume); }
++        if flags & 16 != 0 || new_mode != old_mode {
++            out.push(SystemEvent::OperationMode(if new_mode {
++                OperationMode::Docked
++            } else { OperationMode::Handheld }));
++        }
++        if flags & 32 != 0 { self.closing = true; }
++    }
++
++    fn exit(&self) -> ! {
++        // The official app must first drain the session; socketExit happens
++        // only in exit(), not when HOME or a normal stream closes.
++        self.release();
++        std::process::exit(0)
++    }
++}
++
++impl Drop for NativeLifecycle { fn drop(&mut self) { self.release(); } }
++
++pub fn platform() -> Result<Platform> {
++    // Force extraction of the C archive member defining the weak Skia/ICU
++    // mmap/munmap/pread compatibility symbols before the final static link.
++    // SAFETY: this function has no arguments and no state; it is a link anchor.
++    unsafe { ffi::pf2_skia_compat_link_guard() };
++    let mode = Arc::new(AtomicBool::new(false));
++    let lifecycle = NativeLifecycle::new(mode.clone())?;
++    std::fs::create_dir_all(DATA_DIR)?;
++    let video_slot = Arc::new(display::VideoSlot::default());
++    let display = display::NativeDisplay::new(video_slot.clone(), mode)?;
++    let pads = input::NativePads::new()?;
++    // SAFETY: runtime still alive. appletGetAppletType is a pure query.
++    let applet_mode = unsafe { ffi::pf2_runtime_applet(lifecycle.handle.get()) } != 0;
++    Ok(Platform {
++        display: Box::new(display),
++        video: Arc::new(video::NativeVideo { frames: video_slot }),
++        audio: Arc::new(audio::NativeAudio),
++        pads: Box::new(pads),
++        storage: Arc::new(Dir(PathBuf::from(DATA_DIR))),
++        lifecycle: Box::new(lifecycle),
++        log: Some(Box::new(std::io::stderr())),
++        device: DeviceInfo {
++            platform: "switch", model: "Nintendo Switch 2".to_owned(),
++            firmware: String::new(), gpu: "OunceVK native Vulkan".to_owned(),
++            ui: "official Skia raster / RGBA composition / Vulkan scanout".to_owned(),
++            applet_mode, languages: Vec::new(),
++        },
++    })
++}
+diff --git a/crates/pf-nx-switch2-platform/src/video.rs b/crates/pf-nx-switch2-platform/src/video.rs
+new file mode 100644
+index 0000000..bf563a8
+--- /dev/null
++++ b/crates/pf-nx-switch2-platform/src/video.rs
+@@ -0,0 +1,192 @@
++//! Native AV1 + H.264 decoder adapted to the OFFICIAL VideoSink trait.
++//! Codec bytes are the official Punktfunk QUIC access units; there is no
++//! Moonlight/GameStream protocol code in this backend.
++use std::ptr;
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++use anyhow::{anyhow, bail, ensure, Result};
++use pf_nx_app::core::caps::VideoCaps;
++use pf_nx_app::core::media::{FeedFlags, MediaClock, NotReady, VideoSink, VideoSinkCaps};
++use pf_nx_app::platform::{StreamSpec, VideoDecoders};
++use punktfunk_core::quic;
++
++use crate::display::{VideoPicture, VideoSlot};
++use crate::ffi;
++
++pub struct NativeVideo { pub(crate) frames: Arc<VideoSlot> }
++
++const MAX_WIDTH: u32 = 3840;
++const MAX_HEIGHT: u32 = 2160;
++const MAX_AU: usize = 12 * 1024 * 1024;
++const MAX_DRAIN: usize = 4;
++const CODEC_H264_NATIVE: u32 = 0;
++const CODEC_AV1_NATIVE: u32 = 3;
++
++impl VideoDecoders for NativeVideo {
++    fn caps(&self) -> VideoCaps {
++        // The original VideoCaps model needs the app-level 'av1' extension;
++        // its negotiation path is patched by apply_integration.py.
++        VideoCaps {
++            h264: true, hevc: false, av1: true, pyrowave: false,
++            ten_bit: false, hdr: false, max_channels: 2,
++        }
++    }
++
++    fn open(&self, spec: &StreamSpec) -> Result<Box<dyn VideoSink>> {
++        ensure!(spec.width > 0 && spec.height > 0 && spec.width <= MAX_WIDTH &&
++                spec.height <= MAX_HEIGHT && spec.width % 2 == 0 && spec.height % 2 == 0,
++                "unsupported hardware decode resolution {}x{}", spec.width, spec.height);
++        ensure!(spec.bit_depth == 8 && !spec.chroma444,
++                "only NV12 8-bit 4:2:0 stream is implemented");
++        ensure!(spec.refresh_hz > 0 && spec.refresh_hz <= 60, "decode rate exceeds 60 fps");
++        let codec = match spec.codec {
++            quic::CODEC_H264 => CODEC_H264_NATIVE,
++            quic::CODEC_AV1 => CODEC_AV1_NATIVE,
++            _ => bail!("Switch 2 decoder cannot decode negotiated codec {}", spec.codec),
++        };
++        // AV1 has no Annex B SPS/PPS. H.264 opens after its first access unit
++        // provides parameter sets, before submitting that exact same AU.
++        let decoder = if codec == CODEC_AV1_NATIVE {
++            Some(DecoderSession::new(spec, codec, &[])?)
++        } else { None };
++        Ok(Box::new(NativeSink {
++            spec: spec.clone(), codec,
++            shared: self.frames.clone(),
++            inner: Mutex::new(decoder), started: Instant::now(),
++        }))
++    }
++
++    fn lane_name(&self, codec: u8) -> &'static str {
++        if codec == quic::CODEC_AV1 { "libounce AV1 (NV12)" }
++        else if codec == quic::CODEC_H264 { "libounce H.264 (NV12)" }
++        else { "unsupported" }
++    }
++}
++
++struct DecoderSession { handle: *mut ffi::Handle }
++// The pointer is never accessed concurrently; the C SDK says decoder calls
++// are serialized and NativeSink::inner is a Mutex.
++unsafe impl Send for DecoderSession {}
++
++impl DecoderSession {
++    fn new(spec: &StreamSpec, codec: u32, config: &[u8]) -> Result<Self> {
++        let mut handle = ptr::null_mut();
++        let args = ffi::DecoderSettings {
++            width: spec.width, height: spec.height, fps: spec.refresh_hz,
++            codec, image_count: 4,
++            codec_data: if config.is_empty() { ptr::null() } else { config.as_ptr() },
++            codec_data_length: config.len(), max_sample_bytes: MAX_AU as u64,
++        };
++        // SAFETY: config lives for the duration of the synchronous open call.
++        ffi::check("videoDecoderCreate", unsafe { ffi::pf2_decoder_open(&mut handle, &args) })?;
++        ensure!(!handle.is_null(), "decoder returned no handle");
++        Ok(Self { handle })
++    }
++}
++
++impl Drop for DecoderSession {
++    fn drop(&mut self) {
++        // SAFETY: unique owned decoder, no GPU/decoder pointers escape the feed.
++        unsafe { ffi::pf2_decoder_close(self.handle) };
++    }
++}
++
++struct NativeSink {
++    spec: StreamSpec,
++    codec: u32,
++    shared: Arc<VideoSlot>,
++    inner: Mutex<Option<DecoderSession>>,
++    started: Instant,
++}
++
++impl MediaClock for NativeSink {
++    fn now_ns(&self) -> u64 { self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64 }
++}
++
++impl VideoSink for NativeSink {
++    fn name(&self) -> &'static str { "libounce native video" }
++    fn caps(&self) -> VideoSinkCaps {
++        VideoSinkCaps { pts: true, partial_au: false, flush: true, intra_only: false }
++    }
++    fn clock(&self) -> Option<&dyn MediaClock> { Some(self) }
++
++    fn feed(&self, au: &[u8], pts_ns: u64, flags: FeedFlags) -> Result<()> {
++        ensure!(au.len() <= MAX_AU, "access unit too large");
++        if au.is_empty() || !flags.complete { return Err(NotReady.into()); }
++        let mut locked = self.inner.lock().map_err(|_| anyhow!("decoder mutex poisoned"))?;
++        if locked.is_none() {
++            ensure!(self.codec == CODEC_H264_NATIVE, "uninitialized codec decoder");
++            let mut config = [0u8; 4096];
++            let mut count = 0usize;
++            // SAFETY: all pointers bound to valid slices, size written in count.
++            let rc = unsafe { ffi::pf2_h264_config_from_annexb(
++                au.as_ptr(), au.len(), config.as_mut_ptr(), config.len(), &mut count) };
++            if rc != ffi::OK || count == 0 { return Err(NotReady.into()); }
++            *locked = Some(DecoderSession::new(&self.spec, self.codec, &config[..count])?);
++        }
++        let decoder = locked.as_ref().ok_or_else(|| anyhow!("missing active decoder"))?;
++        // This is a bounded wait for output buffers; no unbounded deadlock on disconnect.
++        // SAFETY: access unit lives through the call and decoder held exclusively by mutex.
++        let rc = unsafe { ffi::pf2_decoder_submit(
++            decoder.handle, au.as_ptr(), au.len(), pts_ns.min(i64::MAX as u64) as i64,
++            4_000_000) };
++        if rc == ffi::NOT_READY { return Err(NotReady.into()); }
++        if rc != ffi::OK {
++            let sdk = unsafe { ffi::pf2_decoder_last_sdk_result(decoder.handle) };
++            // SAFETY: serial decoder access; flush permits a subsequent re-anchor.
++            let _ = unsafe { ffi::pf2_decoder_flush(decoder.handle) };
++            bail!("decoder submit failed: bridge={rc}, sdk={sdk:#x}");
++        }
++        let width = self.spec.width as usize;
++        let height = self.spec.height as usize;
++        for _ in 0..MAX_DRAIN {
++            let mut f = ffi::Frame::default();
++            // SAFETY: f is writable, decoder calls serialized.
++            let rc = unsafe { ffi::pf2_decoder_acquire(decoder.handle, &mut f, 0) };
++            if rc == ffi::NOT_READY { break; }
++            ffi::check("videoDecoderGetFrame", rc)?;
++            let copy_result = (|| -> Result<()> {
++                ensure!(f.width > 0 && f.height > 0 && f.width as usize <= width &&
++                        f.height as usize <= height && f.width % 2 == 0 && f.height % 2 == 0,
++                        "decoded picture geometry invalid");
++                let len = f.width as usize * f.height as usize * 4;
++                let mut rgba = vec![0u8; len];
++                let y_len = f.pitch_y as usize * f.height as usize;
++                let uv_len = f.pitch_uv as usize * (f.height as usize / 2);
++                // The C decoder owns the valid NV12 planes until release below.
++                let rc = unsafe { ffi::pf2_nv12_rgba(
++                    f.plane_y, y_len, f.pitch_y as usize,
++                    f.plane_uv, uv_len, f.pitch_uv as usize,
++                    f.width, f.height, rgba.as_mut_ptr(), rgba.len(), f.width as usize * 4,
++                    1, 0) }; // BT.709 limited-range SDR (HDR not advertised).
++                ffi::check("NV12 to RGBA", rc)?;
++                let picture = VideoPicture {
++                    width: f.width, height: f.height, rgba,
++                    capture_pts_ns: flags.host_pts_ns,
++                    decoded_at: Instant::now(), video_e2e: self.spec.video_e2e.clone(),
++                };
++                *self.shared.frame.lock().map_err(|_| anyhow!("poisoned frame slot"))? = Some(picture);
++                Ok(())
++            })();
++            // SAFETY: release is mandatory EVEN when conversion failed.
++            let release_rc = unsafe { ffi::pf2_decoder_release(decoder.handle) };
++            copy_result?;
++            ffi::check("decoder release image", release_rc)?;
++        }
++        Ok(())
++    }
++
++    fn flush(&self) -> Result<()> {
++        self.shared.frame.lock().map_err(|_| anyhow!("poisoned frame slot"))?.take();
++        let locked = self.inner.lock().map_err(|_| anyhow!("decoder mutex poisoned"))?;
++        if let Some(decoder) = locked.as_ref() {
++            // SAFETY: serial FFI call, decoder still owns every frame.
++            ffi::check("videoDecoderFlush", unsafe { ffi::pf2_decoder_flush(decoder.handle) })?;
++        }
++        Ok(())
++    }
++    fn queue_depth(&self) -> Option<u32> {
++        Some(u32::from(self.shared.frame.lock().is_ok_and(|g| g.is_some())))
++    }
++}

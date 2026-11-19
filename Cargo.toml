@@ -1,0 +1,112 @@
+[package]
+name = "pf-nx"
+description = "Nintendo Switch homebrew client for punktfunk: the title binary."
+version = "1.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "pf-nx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+pf-nx-app = { path = "crates/pf-nx-app" }
+
+[target.'cfg(target_os = "horizon")'.dependencies]
+pf-nx-switch2-platform = { path = "crates/pf-nx-switch2-platform" }
+# For `rt::link_guard`, which keeps the runtime shims in the title's link.
+pf-nx-sys = { path = "crates/pf-nx-sys", default-features = false }
+
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+pf-nx-host = { path = "crates/pf-nx-host" }
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "2"
+exclude = ["vendor/punktfunk"]
+members = [
+    "crates/pf-nx-sys",
+    "crates/pf-nx-vk",
+    "crates/pf-nx-platform",
+    "crates/pf-nx-host",
+    "crates/pf-nx-app",
+    "crates/pf-nx-probe",
+    "crates/pf-nx-switch2-platform",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/punktfunk/client-switch"
+
+[workspace.dependencies]
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
+# Same Skia as the shared console; the console build adds the Vulkan backend (pf-nx-vk).
+skia-safe = { version = "0.153", features = ["textlayout", "embed-freetype", "ganesh", "vulkan"] }
+# One REV for all shared crates: a tag and a rev build two copies whose types don't unify.
+# At least the merge of monorepo #2180, which carries the Horizon cfgs this client builds on.
+punktfunk-core = { git = "https://git.unom.io/unom/punktfunk", rev = "0fc1b6c115519551031c51a20c9dc598fb1ea57d", features = ["quic", "l10n"] }
+pf-client-core = { git = "https://git.unom.io/unom/punktfunk", rev = "0fc1b6c115519551031c51a20c9dc598fb1ea57d", default-features = false }
+pf-console-ui = { git = "https://git.unom.io/unom/punktfunk", rev = "0fc1b6c115519551031c51a20c9dc598fb1ea57d", default-features = false }
+# The parts this crate reads itself. The host's sentences come worded from the core.
+pf-l10n = { git = "https://git.unom.io/unom/punktfunk", rev = "0fc1b6c115519551031c51a20c9dc598fb1ea57d", default-features = false, features = ["client", "console", "host"] }
+# No `pyrowave` here: pf-nx-vk's own feature turns the lane on (plan D14), so a default build
+# compiles none of the wavelet decoder for the console.
+pf-client-video = { git = "https://git.unom.io/unom/punktfunk", rev = "0fc1b6c115519551031c51a20c9dc598fb1ea57d", default-features = false }
+
+# Switch 2: local copy of official Punktfunk core, pinned to
+# 0fc1b6c115519551031c51a20c9dc598fb1ea57d.
+[patch."https://git.unom.io/unom/punktfunk"]
+punktfunk-core = { path = "vendor/punktfunk/crates/core/punktfunk-core" }
+pf-client-core = { path = "vendor/punktfunk/crates/client/pf-client-core" }
+pf-console-ui = { path = "vendor/punktfunk/crates/client/pf-console-ui" }
+pf-l10n = { path = "vendor/punktfunk/l10n" }
+pf-client-video = { path = "vendor/punktfunk/crates/client/pf-client-video" }
+
+# These are used by the Punktfunk application, not the separate rust-src
+# workspace compiled by -Z build-std. libc stays in .cargo/config.toml because
+# std::net must use the Horizon newlib ABI patch too.
+[patch.crates-io]
+getrandom = { path = "toolchain/patches/getrandom" }
+getrandom02 = { path = "toolchain/patches/getrandom-0.2", package = "getrandom" }
+mio = { path = "toolchain/patches/mio" }
+quinn-udp = { path = "toolchain/patches/quinn-udp" }
+tokio = { path = "toolchain/patches/tokio" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+cast_lossless = "warn"
+map_unwrap_or = "warn"
+use_self = "warn"
+doc_markdown = "warn"
+manual_let_else = "warn"
+redundant_closure_for_method_calls = "warn"
+items_after_statements = "warn"
+match_same_arms = "warn"
+format_collect = "warn"
+suspicious_operation_groupings = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+# Fat LTO inlines core's hot paths (AEAD, FEC, QUIC parsing) across crates.
+lto = "fat"
+codegen-units = 1
+# No unwinding across the C boundaries; the panic hook writes the log first.
+panic = "abort"
+debug = "line-tables-only"

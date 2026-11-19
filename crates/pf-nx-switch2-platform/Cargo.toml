@@ -1,0 +1,20 @@
+[package]
+name = "pf-nx-switch2-platform"
+version = "1.1.0"
+description = "Native libounce/OunceVK platform backend for the official Punktfunk Switch client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+skia-safe.workspace = true
+punktfunk-core.workspace = true
+pf-nx-app = { path = "../pf-nx-app" }
+pf-nx-sys = { path = "../pf-nx-sys", default-features = false }
+
+[lints]
+workspace = true

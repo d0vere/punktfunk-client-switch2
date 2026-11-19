@@ -1,0 +1,28 @@
+[package]
+name = "pf-nx-host"
+description = "The Switch client's seams on a developer box: Vulkan offscreen through the system loader (Linux) or CPU raster, a WAV audio sink, scripted pads, a data dir of its own."
+version = "1.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+punktfunk-core.workspace = true
+pf-nx-app = { path = "../pf-nx-app" }
+
+[features]
+# The PyroWave lane on a Linux box, with pf-nx-vk's. Out of v1 (plan D14).
+pyrowave = ["pf-nx-vk/pyrowave"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { workspace = true, features = ["loaded"] }
+pf-nx-vk = { path = "../pf-nx-vk" }
+pf-nx-platform = { path = "../pf-nx-platform" }
+
+[lints]
+workspace = true

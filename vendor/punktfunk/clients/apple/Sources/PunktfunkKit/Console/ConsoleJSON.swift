@@ -1,0 +1,496 @@
+// What this client hands the console, in the console's OWN model shapes (`HostRow`,
+// `WakeStatus`, `PairStatus`, `LibraryGame`, `KnownHosts`), so no Swift mirror type can drift
+// from the Rust structs that deserialize them. The Android client writes the same JSON
+// (`ConsoleJson.kt`) — a player who moves between a phone and an Apple TV finds one carousel.
+// An answer to a command carries that command's `req`, copied verbatim.
+
+import Foundation
+import PunktfunkShared
+
+public enum ConsoleJSON {
+    public static func string(_ value: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
+        else { return "null" }
+        return String(data: data, encoding: .utf8) ?? "null"
+    }
+
+    // MARK: - host rows
+
+    /// The pinned certificate's fingerprint, lowercase hex; empty until the host is paired.
+    private static func fingerprint(_ host: StoredHost) -> String {
+        host.pinnedSHA256.map { $0.map { String(format: "%02x", $0) }.joined() } ?? ""
+    }
+
+    /// The saved host a console command names. The fingerprint keys it: the record that pins
+    /// `fp`, else the unpaired one at `addr:port`, never a record pinned to another
+    /// fingerprint, which is the other system of a dual-boot box. With no `fp` the address
+    /// is all there is.
+    public static func host(
+        in hosts: [StoredHost], fp: String, addr: String, port: UInt16
+    ) -> StoredHost? {
+        if !fp.isEmpty, let pinned = hosts.first(where: { fingerprint($0) == fp }) {
+            return pinned
+        }
+        return hosts.first {
+            $0.address == addr && $0.port == port && (fp.isEmpty || $0.pinnedSHA256 == nil)
+        }
+    }
+
+    /// The saved host behind a row key: the fingerprint or `addr:port`, with a pinned card's
+    /// preset id behind a NUL. The port sits behind the last colon, as an IPv6 address has
+    /// its own; an empty key names no host.
+    public static func host(in hosts: [StoredHost], key: String) -> StoredHost? {
+        let base = key.split(separator: "\u{0}", omittingEmptySubsequences: false)
+            .first.map(String.init) ?? key
+        guard !base.isEmpty else { return nil }
+        if let host = hosts.first(where: { fingerprint($0) == base }) { return host }
+        guard let colon = base.lastIndex(of: ":"),
+              let port = UInt16(base[base.index(after: colon)...])
+        else { return nil }
+        let address = String(base[..<colon])
+        return hosts.first { $0.address == address && $0.port == port }
+    }
+
+    /// The preset a pinned card's row key carries behind its NUL; nil for a host's own row.
+    public static func preset(ofKey key: String) -> String? {
+        guard let nul = key.firstIndex(of: "\u{0}") else { return nil }
+        let id = key[key.index(after: nul)...]
+        return id.isEmpty ? nil : String(id)
+    }
+
+    /// `HostRow.key` — the pinned fingerprint when there is one, else `addr:port`.
+    public static func rowKey(_ fingerprint: String, _ address: String, _ port: UInt16) -> String {
+        fingerprint.isEmpty ? "\(address):\(port)" : fingerprint
+    }
+
+    private static func chip(_ preset: StreamPreset) -> [String: Any] {
+        [
+            "id": preset.id, "name": preset.name, "accent": preset.accent ?? NSNull(),
+            // Read by the speed test alone: a preset that PINS bitrate is the layer its host
+            // streams at, so the console must not offer to write the global instead.
+            "bitrate_kbps": preset.overrides.bitrateKbps ?? NSNull(),
+            // The card's Screen section and line under a preset that pins the host screen.
+            "host_screen": preset.overrides.hostScreen ?? NSNull(),
+        ]
+    }
+
+    private static func actions(_ list: [HostAction]) -> [[String: Any]] {
+        list.map {
+            [
+                "id": $0.id, "label": $0.label, "danger": $0.danger, "available": $0.available,
+                "unavailable_reason": $0.unavailableReason ?? "",
+            ]
+        }
+    }
+
+    /// `HostRow.screens`: the host's `GET /display/targets` body in its own keys, `may_choose`
+    /// and `role` included, or null before it answers.
+    private static func screensJSON(
+        _ screens: [String: DisplayTargets], _ host: StoredHost
+    ) -> Any {
+        guard let rows = screens[fingerprint(host)], let data = try? JSONEncoder().encode(rows),
+              let json = try? JSONSerialization.jsonObject(with: data)
+        else { return NSNull() }
+        return json
+    }
+
+    /// A `SetScreen` command's write: its `screen`, and `topology` when the row is a role.
+    public static func screenPick(_ command: [String: Any]) -> ScreenPick? {
+        guard let data = try? JSONSerialization.data(withJSONObject: command) else { return nil }
+        return try? JSONDecoder().decode(ScreenPick.self, from: data)
+    }
+
+    /// The home carousel: saved hosts in store order, which is the order they were added, each
+    /// followed by its pinned preset cards, then the discovered-but-unsaved by name. The console
+    /// applies the player's sort on top. `clients/shared/host-row-vectors.json` holds this, the
+    /// desktop service's `rows()` and the Android producer to the same rows.
+    public static func hostRows(
+        saved: [StoredHost], discovered: [DiscoveredHost], online: Set<StoredHost.ID>,
+        presets: [StreamPreset], actions hostActions: [String: [HostAction]] = [:],
+        running: [String: String] = [:], screens: [String: DisplayTargets] = [:]
+    ) -> String {
+        var out: [[String: Any]] = []
+        let same = { (d: DiscoveredHost, host: StoredHost) in
+            d.matches(pin: fingerprint(host), address: host.address, port: host.port)
+        }
+        for host in saved {
+            let advert = discovered.first { same($0, host) }
+            var base = row(host, advert: advert, online: online.contains(host.id),
+                           presets: presets, hostActions: hostActions, running: running)
+            base["screens"] = screensJSON(screens, host)
+            out.append(base)
+            // A pinned card shares the primary tile's live state; its key rides the preset id
+            // behind a NUL, which no fingerprint or `addr:port` can hold.
+            var seen = Set<String>()
+            for id in host.pinnedPresetIDs ?? [] where seen.insert(id).inserted {
+                guard let preset = presets.first(where: { $0.id == id }) else { continue }
+                var card = base
+                card["key"] = "\(base["key"] as? String ?? "")\u{0}\(preset.id)"
+                card["pin"] = chip(preset)
+                card["bound_preset"] = NSNull()
+                out.append(card)
+            }
+        }
+        let unsaved = discovered.filter { d in !saved.contains { same(d, $0) } }
+        for d in unsaved.sorted(by: { $0.name.lowercased() < $1.name.lowercased() }) {
+            let fp = d.fingerprintHex ?? ""
+            out.append([
+                "key": rowKey(fp, d.host, d.port), "name": d.name.isEmpty ? d.host : d.name,
+                "addr": d.host, "port": Int(d.port), "fp_hex": fp, "paired": false,
+                "saved": false, "online": true, "mgmt_port": Int(d.mgmtPort ?? punktfunkDefaultMgmtPort),
+                "can_wake": false, "clipboard_sync": false, "last_used": NSNull(),
+                "os": d.osChain, "pin": NSNull(), "bound_preset": NSNull(),
+                // Unsaved: no identity to ask what it is running.
+                "running": "",
+            ])
+        }
+        return string(out)
+    }
+
+    private static func row(
+        _ host: StoredHost, advert: DiscoveredHost?, online: Bool, presets: [StreamPreset],
+        hostActions: [String: [HostAction]], running: [String: String]
+    ) -> [String: Any] {
+        let fp = fingerprint(host)
+        let bound = host.presetID.flatMap { id in presets.first { $0.id == id } }
+        return [
+            "key": rowKey(fp, host.address, host.port),
+            "id": host.id.uuidString,
+            "name": host.displayName,
+            "addr": host.address,
+            "port": Int(host.port),
+            "fp_hex": fp,
+            "paired": host.pinnedSHA256 != nil,
+            "saved": true,
+            // Presence is the probe alone. An advert only says where to look: a suspending host
+            // sends no mDNS goodbye, so its record lingers long enough to keep the pip green.
+            "online": online,
+            "mgmt_port": Int(advert?.mgmtPort ?? host.effectiveMgmtPort),
+            "can_wake": !online && WakePolicy.canWake(host.wakeMacs),
+            "clipboard_sync": host.clipboardSync ?? false,
+            "last_used": host.lastConnected.map { Int($0.timeIntervalSince1970) } ?? NSNull(),
+            "os": advert.map { $0.osChain.isEmpty ? (host.osChain ?? "") : $0.osChain }
+                ?? (host.osChain ?? ""),
+            "actions": actions(hostActions[fp] ?? []),
+            "pin": NSNull(),
+            "bound_preset": bound.map(chip) ?? NSNull(),
+            "running": running[fp] ?? "",
+            "game_presets": host.gamePresets ?? [:],
+            "profile": host.pickedProfile?.bridgeJSON ?? NSNull(),
+        ]
+    }
+
+    /// One row as a console entry (`{"library": <HostRow>}`) — the shelf to open.
+    public static func entry(_ host: StoredHost, pin: StreamPreset?, presets: [StreamPreset]) -> String {
+        var row = row(
+            host, advert: nil, online: true, presets: presets, hostActions: [:], running: [:])
+        if let pin {
+            row["key"] = "\(row["key"] as? String ?? "")\u{0}\(pin.id)"
+            row["pin"] = chip(pin)
+            row["bound_preset"] = NSNull()
+        }
+        return string(["library": row])
+    }
+
+    /// `{"pair": HostRow}`: the console's Pair screen for this host, over Home.
+    public static func pairEntry(_ host: StoredHost, presets: [StreamPreset]) -> String {
+        string([
+            "pair": row(
+                host, advert: nil, online: true, presets: presets, hostActions: [:], running: [:]),
+        ])
+    }
+
+    /// A question the console asks in place of a system alert; `choices` lead with the default.
+    public static func prompt(id: String, title: String, message: String, choices: [String]) -> String {
+        string(["id": id, "title": title, "message": message, "choices": choices])
+    }
+
+    /// `KnownHosts` — what the console needs to build a `punktfunk://` link.
+    public static func knownHosts(_ saved: [StoredHost]) -> String {
+        string([
+            "hosts": saved.map { host in
+                [
+                    "name": host.name, "addr": host.address, "port": Int(host.port),
+                    "fp_hex": fingerprint(host), "paired": host.pinnedSHA256 != nil,
+                    "id": host.id.uuidString, "mac": host.wakeMacs, "os": host.osChain ?? "",
+                    "mgmt_port": host.mgmtPort.map(Int.init) ?? NSNull(),
+                    "preset_id": host.presetID ?? NSNull(),
+                    "pinned_presets": host.pinnedPresetIDs ?? [],
+                ]
+            }
+        ])
+    }
+
+    /// One connected controller as the Players tab shows it.
+    public struct Pad {
+        public var name: String
+        /// Stable across a refresh: the rumble test names the pad by it.
+        public var key: String
+        /// The virtual-pad type's wire byte, which picks the card's glyph family.
+        public var pref: UInt32
+        public var detail: String
+        public var forwarded: Bool
+        public var rumble: Bool
+        /// 0...1, nil when the pad reports none.
+        public var battery: Float?
+        public var charging: Bool
+
+        public init(_ c: GamepadManager.DiscoveredController, forwarded: Bool) {
+            self.init(
+                name: c.name, key: c.id, pref: c.kind.rawValue, detail: c.productCategory,
+                forwarded: forwarded, rumble: c.hasHaptics, battery: c.batteryLevel,
+                charging: c.isCharging)
+        }
+
+        public init(
+            name: String, key: String, pref: UInt32, detail: String, forwarded: Bool,
+            rumble: Bool, battery: Float?, charging: Bool
+        ) {
+            (self.name, self.key, self.pref, self.detail) = (name, key, pref, detail)
+            (self.forwarded, self.rumble, self.battery, self.charging) =
+                (forwarded, rumble, battery, charging)
+        }
+    }
+
+    /// The pads push: the legend's pad and its glyph family, then every pad, then the inputs
+    /// that are not pads (`kind` is `keyboard`, `mouse` or `remote`).
+    public static func pads(
+        _ pads: [Pad], active: Pad?, others: [(name: String, kind: String)] = []
+    ) -> String {
+        var doc: [String: Any] = [
+            "pads": pads.map { pad -> [String: Any] in
+                [
+                    "name": pad.name, "key": pad.key, "pref": pad.pref, "detail": pad.detail,
+                    "forwarded": pad.forwarded, "rumble": pad.rumble,
+                    "battery": pad.battery.map {
+                        ["percent": Int(($0 * 100).rounded()), "charging": pad.charging]
+                    } as Any? ?? NSNull(),
+                ]
+            }
+        ]
+        doc["others"] = others.map { ["name": $0.name, "kind": $0.kind] }
+        if let active {
+            doc["label"] = active.name
+            doc["pref"] = active.pref
+        }
+        return string(doc)
+    }
+
+    /// The input test's push for the iOS SC2 menu pad, nil while none delivers. Same names and
+    /// signs as `ConsoleModel.pushPadTest`'s GameController path: +y is down, a trigger counts
+    /// as held past half travel, ⧉ is Back and ☰ is Start.
+    @MainActor public static func padTest(sc2 manager: GamepadManager) -> String? {
+        manager.sc2MenuState.map { padTest(sc2: $0) }
+    }
+
+    static func padTest(sc2 s: Sc2Device.State) -> String {
+        let buttons: [(String, UInt32)] = [
+            ("A", Sc2Device.btnA), ("B", Sc2Device.btnB), ("X", Sc2Device.btnX),
+            ("Y", Sc2Device.btnY), ("LB", Sc2Device.btnLB), ("RB", Sc2Device.btnRB),
+            ("Back", Sc2Device.btnView), ("Start", Sc2Device.btnMenu),
+            ("Guide", Sc2Device.btnSteam), ("LS", Sc2Device.btnL3), ("RS", Sc2Device.btnR3),
+            ("Up", Sc2Device.btnDpadUp), ("Down", Sc2Device.btnDpadDown),
+            ("Left", Sc2Device.btnDpadLeft), ("Right", Sc2Device.btnDpadRight),
+        ]
+        var held = buttons.filter { s.buttons & $0.1 != 0 }.map(\.0)
+        if s.lt > 127 { held.append("LT") }
+        if s.rt > 127 { held.append("RT") }
+        let axes: [[Any]] = [
+            ["LX", Float(s.lsX) / 32767], ["LY", -Float(s.lsY) / 32767],
+            ["RX", Float(s.rsX) / 32767], ["RY", -Float(s.rsY) / 32767],
+            ["LT", Float(s.lt) / 255], ["RT", Float(s.rt) / 255],
+        ]
+        return string(["held": held, "axes": axes])
+    }
+
+    /// The catalog with each preset's overrides, so a settings row can say when a host's bound
+    /// preset outranks the global it shows.
+    public static func presets(_ presets: [StreamPreset]) -> String {
+        string(
+            presets.map { preset in
+                ["id": preset.id, "name": preset.name, "overrides": overrides(preset.overrides)]
+            })
+    }
+
+    /// A preset's overrides in the console's own overlay spelling. Only the keys the console
+    /// reads: an override it cannot parse leaves that preset unmarked, not the catalog empty.
+    private static func overrides(_ o: SettingsOverlay) -> [String: Any] {
+        var j: [String: Any] = [:]
+        for (key, value) in consoleFields { j[key] = value(o) }
+        return j
+    }
+
+    /// Every key a console save sets or clears, with how `overrides(_:)` spells a preset's value.
+    private static let consoleFields: [(key: String, value: @Sendable (SettingsOverlay) -> Any?)] = [
+        ("width", { $0.width }),
+        ("height", { $0.height }),
+        ("match_window", { $0.matchWindow }),
+        ("compositor", { $0.compositor.map(ConsoleSettings.compositorName) }),
+        ("gamepad", { $0.gamepadType.map(ConsoleSettings.padTypeName) }),
+        ("refresh_hz", { $0.refreshHz }),
+        ("bitrate_kbps", { $0.bitrateKbps }),
+        ("pyrowave_bpp", { $0.pyrowaveBpp }),
+        ("render_scale", { $0.renderScale }),
+        ("video_fit", { $0.videoFit }),
+        ("screens", { $0.screens }),
+        ("host_screen", { $0.hostScreen }),
+        ("codec", { $0.codec }),
+        ("hdr_enabled", { $0.hdrEnabled }),
+        ("enable_444", { $0.enable444 }),
+        ("ten_bit_sdr", { $0.tenBitSdr }),
+        ("audio_channels", { $0.audioChannels }),
+        ("audio_format", { $0.audioFormat }),
+        ("mic_enabled", { $0.micEnabled }),
+        ("echo_cancel", { $0.echoCancel }),
+        ("keep_host_audio", { $0.keepHostAudio }),
+        ("touch_mode", { $0.touchMode }),
+        ("mouse_mode", { $0.mouseMode }),
+        ("invert_scroll", { $0.invertScroll }),
+        ("overlay_actions", { $0.overlayActions }),
+        ("shortcuts", { $0.shortcuts }),
+        ("inhibit_shortcuts", { $0.inhibitShortcuts }),
+        ("gamepad_forwarding", { $0.gamepadForwarding }),
+        ("system_buttons", { $0.systemButtons }),
+        ("guide_gesture", { $0.guideGesture }),
+        ("stats_verbosity", { $0.statsVerbosity }),
+        ("fullscreen_on_stream", { $0.fullscreenWhileStreaming }),
+        ("present_priority", { $0.presentPriority }),
+        ("smooth_buffer", { $0.smoothBuffer }),
+        ("vsync", { $0.vsync }),
+        ("allow_vrr", { $0.allowVRR }),
+    ]
+
+    /// The console's saved overlay over `base`: every key the console edits comes from it,
+    /// set or cleared, and every override only this app knows stays.
+    public static func overlay(_ console: [String: Any], over base: SettingsOverlay) -> SettingsOverlay {
+        guard let data = try? JSONEncoder().encode(base),
+            var j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return base }
+        for (key, _) in consoleFields { j[key] = console[key] }
+        // The console names these two; this app's overlay stores the wire number.
+        j["compositor"] = (console["compositor"] as? String).flatMap(ConsoleSettings.compositorTag)
+        j["gamepad"] = (console["gamepad"] as? String).flatMap(ConsoleSettings.padTypeTag)
+        guard let merged = try? JSONSerialization.data(withJSONObject: j.compactMapValues { $0 }),
+            let overlay = try? JSONDecoder().decode(SettingsOverlay.self, from: merged)
+        else { return base }
+        return overlay
+    }
+
+    // MARK: - wake and pair
+
+    /// The `Wake`'s `req`; epoch 0 for a wake this app started on its own.
+    public static let unasked: [String: Any] = ["host": "", "epoch": 0]
+
+    public static func wake(
+        req: Any, key: String, name: String, seconds: Int, timedOut: Bool, online: Bool,
+        thenConnect: Bool
+    ) -> String {
+        string([
+            "req": req, "key": key, "name": name, "seconds": seconds, "timed_out": timedOut,
+            "online": online, "then_connect": thenConnect,
+        ])
+    }
+
+    public static func pairBusy(_ req: Any) -> String { pair(req, "Busy") }
+    public static func pairFailed(_ req: Any, _ why: String) -> String {
+        pair(req, ["Failed": why])
+    }
+    public static func pairPaired(_ req: Any, key: String) -> String {
+        pair(req, ["Paired": ["key": key]])
+    }
+
+    /// `PairStatus`: the phase under the `Pair` or `RequestAccess` command's `req`.
+    private static func pair(_ req: Any, _ phase: Any) -> String {
+        string(["req": req, "phase": phase])
+    }
+
+    // MARK: - library
+
+    /// `{"req", "games": [LibraryGame]}` from this client's catalog, under the `FetchLibrary`
+    /// command's `req`.
+    public static func libraryGames(_ req: Any, _ games: [GameEntry]) -> String {
+        string(["req": req, "games": games.map(libraryGame)])
+    }
+
+    /// One `LibraryGame` — the desktop service's `to_model` mapping. Without `stats` the Recent
+    /// and Most played sorts fall back to host order. `overrides` only when the host set some.
+    private static func libraryGame(_ g: GameEntry) -> [String: Any] {
+        var row: [String: Any] = [
+            "id": g.id, "title": g.title, "store": g.store,
+            "launcher": g.role == "launcher",
+            "icon": g.iconToken ?? "",
+            "platform": g.platform ?? NSNull(), "developer": g.developer ?? NSNull(),
+            "year": g.releaseYear ?? NSNull(), "genres": g.genres ?? [],
+            "stats": g.stats.map { s -> [String: Any] in
+                [
+                    "last_played_unix_ms": s.lastPlayedUnixMs, "play_time_ms": s.playTimeMs,
+                    "last_run_ms": s.lastRunMs, "launch_count": s.launchCount,
+                ]
+            } ?? NSNull(),
+            "running": false,
+            "install": g.install.map { i -> [String: Any] in
+                var o: [String: Any] = ["state": i.state]
+                if let size = i.sizeBytes { o["size_bytes"] = size }
+                if let free = i.freeBytes { o["free_bytes"] = free }
+                return o
+            } ?? NSNull(),
+        ]
+        if let o = g.overrides, let data = try? JSONEncoder().encode(o) {
+            row["overrides"] = try? JSONSerialization.jsonObject(with: data)
+        }
+        return row
+    }
+
+    /// The `FetchHidden` answer for `profile` on host `fp`: `{"fp_hex", "profile", "answer"}`,
+    /// `answer` a `HiddenAnswer` — `{"Listed": [LibraryGame]}`, or `{"Failed": why}` when
+    /// `games` is nil.
+    public static func hiddenList(
+        fp: String, profile: String, games: [GameEntry]?, why: String = ""
+    ) -> String {
+        let answer: [String: Any] = games.map { ["Listed": $0.map(libraryGame)] } ?? ["Failed": why]
+        return string(["fp_hex": fp, "profile": profile, "answer": answer])
+    }
+
+    /// `HideAnswer`: what a `SetHidden` came to, echoing its host, profile, title and `hidden`.
+    public static func hideAnswer(
+        fp: String, profile: String, appID: String, hidden: Bool, done: Bool, notice: String
+    ) -> String {
+        string([
+            "fp_hex": fp, "profile": profile, "app_id": appID, "hidden": hidden, "done": done,
+            "notice": notice,
+        ])
+    }
+
+    /// A library phase (`"Ready"`, `"Empty"`, `{"Error": …}`) under the `FetchLibrary`'s `req`.
+    public static func libraryPhase(_ req: Any, _ phase: Any) -> String {
+        string(["req": req, "phase": phase])
+    }
+
+    /// `/status` `downloads[]` and `grants`, as the console's `DownloadsPush`.
+    public static func downloads(_ downloads: [HostDownload], grants: UInt32?) -> String {
+        struct Push: Encodable {
+            var downloads: [HostDownload]
+            var grants: UInt32?
+        }
+        let json = try? JSONEncoder().encode(Push(downloads: downloads, grants: grants))
+        return json.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    public static func libraryError(_ req: Any, title: String, body: String, canRetry: Bool)
+        -> String
+    {
+        libraryPhase(req, ["Error": ["title": title, "body": body, "can_retry": canRetry]])
+    }
+
+    /// `/status` games; an entry without an id has no tile.
+    public static func runningGames(_ games: [RunningGame]) -> String {
+        string(
+            games.compactMap { g -> [String: Any]? in
+                guard let id = g.appID else { return nil }
+                return [
+                    "app_id": id, "state": g.state, "awaiting_window": g.awaitingWindow ?? false,
+                    "endable": g.endable ?? false,
+                ]
+            })
+    }
+}

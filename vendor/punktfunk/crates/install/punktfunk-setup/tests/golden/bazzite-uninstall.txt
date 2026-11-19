@@ -1,0 +1,8 @@
+==> Detected bazzite → sysext (guide: https://docs.punktfunk.unom.io/docs/bazzite)
+==> Uninstalling the host (https://docs.punktfunk.unom.io/docs/uninstall)
+  + systemctl --user disable --now punktfunk-host punktfunk-web punktfunk-scripting 2>/dev/null || true
+  + sudo punktfunk-sysext remove
+
+  Removed. Kept for a reinstall: ~/.config/punktfunk, the punktfunk, punktfunk-door and
+  punktfunk-update groups, and your firewall rules.
+  The one-command cleanups for each are on https://docs.punktfunk.unom.io/docs/uninstall#linux-hosts

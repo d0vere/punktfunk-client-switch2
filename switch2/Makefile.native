@@ -1,0 +1,28 @@
+# Incremental Switch 2 native C objects; keep libpf2native.a timestamp unchanged when no C changed.
+ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+SDK := $(if $(DEVKITPRO),$(DEVKITPRO),/opt/devkitpro)
+CC := $(SDK)/devkitA64/bin/aarch64-none-elf-gcc
+AR := $(SDK)/devkitA64/bin/aarch64-none-elf-ar
+NATIVE := $(ROOT)/ports/switch2/native
+OUT := $(ROOT)/.pf2-work/native-build
+PARTS := pf2_nv12 pf2_h264_units pf2_decoder_switch2 pf2_audio_switch2 pf2_input_switch2 pf2_vulkan_switch2 pf2_runtime_switch2 pf2_skia_compat
+OBJS := $(addprefix $(OUT)/,$(addsuffix .o,$(PARTS)))
+CFLAGS2 := -std=c11 -O2 -g -fPIC -Wall -Wextra -D__SWITCH2__ -D__SWITCH__
+
+.PHONY: all FORCE
+all: $(OUT)/libpf2native.a
+$(OUT):
+	@mkdir -p "$@"
+$(OUT)/.flags: FORCE | $(OUT)
+	@printf '%s\n' '$(CC) $(CFLAGS2) $(CFLAGS) $(CPPFLAGS) $(SDK)' | cmp -s - "$@" || \
+	  printf '%s\n' '$(CC) $(CFLAGS2) $(CFLAGS) $(CPPFLAGS) $(SDK)' > "$@"
+$(OUT)/%.o: $(NATIVE)/%.c $(NATIVE)/pf2_native.h $(OUT)/.flags
+	$(CC) -c $(CFLAGS2) $(CFLAGS) $(CPPFLAGS) -I"$(NATIVE)" "$<" -o "$@"
+$(OUT)/pf2_skia_compat.o: EXTRA = -I"$(ROOT)/toolchain/skia/include"
+$(OUT)/pf2_skia_compat.o: $(ROOT)/toolchain/skia/include/sys/mman.h
+# Special rule: newlib sys/mman header only for Skia shim (not unrelated files).
+$(OUT)/pf2_skia_compat.o: $(NATIVE)/pf2_skia_compat.c $(NATIVE)/pf2_native.h $(OUT)/.flags
+	$(CC) -c $(CFLAGS2) $(CFLAGS) $(CPPFLAGS) -I"$(NATIVE)" $(EXTRA) "$<" -o "$@"
+$(OUT)/libpf2native.a: $(OBJS)
+	$(AR) rcs "$@" $(OBJS)
+	@echo "Native archive updated: $@"

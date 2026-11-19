@@ -1,0 +1,462 @@
+//! Pinned IronRDP keeper and credential-free trust handshake.
+//!
+//! Both roles connect only to `127.0.0.2`, on the one port [`keeper::rdp_port`] names: the
+//! seat listener's while it is in place, else Remote Desktop's 3389. They advertise CredSSP/NLA
+//! without legacy TLS login, and require a HYBRID security selection. `trust` stops
+//! immediately after RDP negotiation and the TLS handshake, before CredSSP, and
+//! reports the observed SHA-256 leaf pin. Runtime TLS verifies that exact pin
+//! before `connect_finalize` can serialize credentials. The keeper requests a
+//! 640x480 desktop, processes protocol responses, discards decoded pixels, and
+//! remains connected until its job is closed or the server disconnects it.
+
+use ironrdp::connector::{
+    self, ClientConnector, ClientConnectorState, ConnectionResult, ConnectorErrorKind, Credentials,
+};
+use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp::session::image::DecodedImage;
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput};
+use pf_seats::windows::keeper::{self, RdpBootstrap};
+use pf_seats::BackendError;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+use x509_cert::der::Decode as _;
+use zeroize::Zeroize as _;
+
+type WinResult<T> = Result<T, BackendError>;
+
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const ACTIVE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type RdpFramed = ironrdp_blocking::Framed<TlsStream>;
+/// The TLS-wrapped framed stream, the leaf public key CredSSP binds to, and the observed leaf pin.
+type Negotiated = (RdpFramed, Vec<u8>, Option<[u8; 32]>);
+
+fn backend_error(code: &str, message: impl Into<String>) -> BackendError {
+    BackendError::new(code, message)
+}
+
+pub(crate) fn io_error(code: &str, context: &str, error: impl std::fmt::Display) -> BackendError {
+    backend_error(code, format!("{context}: {error}"))
+}
+
+/// The SHA-256 of TermService's TLS leaf, read before any credential could be sent.
+pub(crate) fn observe_pin() -> WinResult<[u8; 32]> {
+    let config = connector_config(String::new(), String::new(), None);
+    let mut connector = ClientConnector::new(config, UNBOUND);
+    let (_framed, _public_key, observed) = negotiate_tls(&mut connector, None)?;
+    observed.ok_or_else(|| {
+        backend_error(
+            "rdp_certificate",
+            "RDP TLS handshake did not expose a leaf certificate",
+        )
+    })
+}
+
+/// Consecutive reattach attempts before the keeper gives the seat back to the supervisor. Ten at
+/// the delay below covers a graphics-subsystem reset without letting a seat that cannot hold a
+/// session spin.
+const REATTACH_ATTEMPTS: u32 = 10;
+/// Long enough for the server's graphics subsystem to finish resetting before the next connect.
+const REATTACH_DELAY: Duration = Duration::from_secs(3);
+/// A connection that lasted this long held, so its drop starts a new count. It also covers a seat
+/// host's own drop whose mark the keeper missed.
+const HELD: Duration = Duration::from_secs(30);
+
+/// Hold the seat's session open, reattaching whenever the connection drops but the session does
+/// not. A neighbouring seat logging off knocks this connection over — the server reports its
+/// graphics subsystem in an error state — and the session survives as `Disconnected`, so exiting
+/// there would strand a seat that only needed reconnecting.
+///
+/// The session's existence is the test, not the disconnect reason: a logoff removes it, anything
+/// recoverable leaves it. That needs no match on the server's English description. A drop the
+/// seat host marked as its own ([`keeper::host_disconnected`]) spends no attempt. A sign-in the
+/// server refuses ([`REFUSED`]) ends the keeper at once: every retry is one more bad logon
+/// toward the account's lockout, and the supervisor's next start names the changed password.
+pub(crate) fn keep_from_stdin() -> WinResult<()> {
+    let mut input = std::io::stdin().lock();
+    let mut bootstrap = RdpBootstrap::read_from(&mut input)
+        .map_err(|error| io_error("keeper_bootstrap", "read RDP keeper bootstrap", error))?;
+    let domain = Some(keeper::computer_name()?);
+    let account = bootstrap.account.clone();
+    let mut attempt = 0;
+    let error = loop {
+        let connected = Instant::now();
+        let since = SystemTime::now();
+        let Err(error) = keep_session(&bootstrap, domain.clone(), &account) else {
+            return Ok(());
+        };
+        if error.code == REFUSED {
+            break error;
+        }
+        // No session left means the seat is gone (logged off, or it never came up): hand the
+        // error back so the supervisor restarts the seat rather than reconnecting to nothing.
+        let Ok(Some(session)) = keeper::session_of(&account) else {
+            break error;
+        };
+        if connected.elapsed() >= HELD {
+            attempt = 0;
+        }
+        if keeper::host_disconnected(&bootstrap.host_root, since) {
+            eprintln!(
+                "seat keeper: reattaching to session {session}, which its host disconnected (attempt {attempt}/{REATTACH_ATTEMPTS} kept)"
+            );
+        } else {
+            attempt += 1;
+            if attempt > REATTACH_ATTEMPTS {
+                break error;
+            }
+            eprintln!(
+                "seat keeper: reattaching to session {session} after {error} (attempt {attempt}/{REATTACH_ATTEMPTS})"
+            );
+        }
+        std::thread::sleep(REATTACH_DELAY);
+    };
+    bootstrap.password.zeroize();
+    Err(error)
+}
+
+/// One connect-and-hold. The password is copied per attempt because the connector consumes it;
+/// the copy is wiped on every path but the one that hands it to IronRDP. A sign-in the server
+/// refuses answers [`REFUSED`].
+fn keep_session(bootstrap: &RdpBootstrap, domain: Option<String>, account: &str) -> WinResult<()> {
+    let config = connector_config(account.to_owned(), bootstrap.password.to_string(), domain);
+    let mut attempt = Wiped(Some(ClientConnector::new(config, UNBOUND)));
+    let (mut framed, public_key, observed) =
+        negotiate_tls(attempt.connector(), Some(bootstrap.pin))?;
+    if observed != Some(bootstrap.pin) {
+        return Err(backend_error(
+            "rdp_pin_changed",
+            "RDP leaf certificate does not match the trusted pin",
+        ));
+    }
+    let mut connector = attempt.hand_over();
+    let upgraded = ironrdp_blocking::mark_as_upgraded(
+        ironrdp_blocking::skip_connect_begin(&mut connector),
+        &mut connector,
+    );
+    let mut network = NoExternalNetwork;
+    let result = ironrdp_blocking::connect_finalize(
+        upgraded,
+        connector,
+        &mut framed,
+        &mut network,
+        "localhost".to_owned().into(),
+        public_key,
+        None,
+    )
+    .map_err(|error| {
+        let code = if refused(error.kind()) {
+            REFUSED
+        } else {
+            "rdp_connect"
+        };
+        io_error(code, "IronRDP connection finalization failed", error)
+    })?;
+    active_loop(result, framed)
+}
+
+/// The code of a sign-in the server refused.
+const REFUSED: &str = "rdp_signin_refused";
+
+/// The server refused the credential: CredSSP carried its error status back, or HYBRID_EX's
+/// early result denied the account. A dropped or garbled link is neither.
+fn refused(kind: &ConnectorErrorKind) -> bool {
+    match kind {
+        ConnectorErrorKind::Credssp(error) => error.nstatus.is_some(),
+        ConnectorErrorKind::AccessDenied => true,
+        _ => false,
+    }
+}
+
+/// The client address before a connect learns the real one, which [`negotiate_tls`] sets.
+const UNBOUND: SocketAddr = SocketAddr::new(LOOPBACK, 0);
+
+/// One attempt's connector, whose password is wiped when it drops here. [`Self::hand_over`] gives
+/// it to `connect_finalize`, and IronRDP's copies from then on are IronRDP's.
+struct Wiped(Option<ClientConnector>);
+
+impl Wiped {
+    fn connector(&mut self) -> &mut ClientConnector {
+        self.0
+            .as_mut()
+            .expect("the connector is handed over once, last")
+    }
+
+    fn hand_over(mut self) -> ClientConnector {
+        self.0
+            .take()
+            .expect("the connector is handed over once, last")
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        if let Some(connector) = &mut self.0
+            && let Credentials::UsernamePassword { password, .. } =
+                &mut connector.config.credentials
+        {
+            password.zeroize();
+        }
+    }
+}
+
+fn connector_config(
+    username: String,
+    password: String,
+    domain: Option<String>,
+) -> connector::Config {
+    connector::Config {
+        credentials: Credentials::UsernamePassword { username, password },
+        domain,
+        enable_tls: false,
+        enable_credssp: true,
+        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_layout: 0,
+        keyboard_functional_keys_count: 12,
+        ime_file_name: String::new(),
+        dig_product_id: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        desktop_size: connector::DesktopSize {
+            width: 640,
+            height: 480,
+        },
+        bitmap: None,
+        client_build: 0,
+        client_name: "PunktfunkSeats".to_owned(),
+        client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+        platform: MajorPlatformType::WINDOWS,
+        enable_server_pointer: false,
+        request_data: None,
+        autologon: false,
+        // A remote session has NO audio endpoint of its own: with playback redirection off,
+        // MMDevice enumerates zero renders inside it, so a seat host has nothing to
+        // loopback-capture and desktop audio can never open. Negotiating it gives the session its
+        // own render endpoint, which is also what keeps one seat's audio out of another's.
+        enable_audio_playback: true,
+        pointer_software_rendering: false,
+        performance_flags: PerformanceFlags::default(),
+        desktop_scale_factor: 100,
+        hardware_id: None,
+        license_cache: None,
+        timezone_info: TimezoneInfo::default(),
+        compression_type: None,
+        multitransport_flags: None,
+    }
+}
+
+/// The listener [`keeper::rdp_port`] names: same TermService and certificate either way, but
+/// only the seat listener's sessions get pad audio endpoints. A seat listener that is in place
+/// and refuses has not been opened by TermService yet: nothing answers there, so Remote
+/// Desktop's own port serves the seat, without pad audio.
+fn connect() -> WinResult<TcpStream> {
+    let dial = |port| {
+        let address = SocketAddr::new(LOOPBACK, port);
+        TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+            .map_err(|error| (error.kind(), format!("connect to {address}"), error))
+    };
+    let port = keeper::rdp_port();
+    let connected = match dial(port) {
+        Err((std::io::ErrorKind::ConnectionRefused, ..)) if port != keeper::RDP_PORT => {
+            dial(keeper::RDP_PORT)
+        }
+        connected => connected,
+    };
+    connected.map_err(|(_, what, error)| io_error("rdp_connect", &what, error))
+}
+
+/// Connects `connector` and runs it to the TLS upgrade, then the TLS handshake against
+/// `expected_pin`. The caller keeps `connector` on every path, so it can wipe its password.
+fn negotiate_tls(
+    connector: &mut ClientConnector,
+    expected_pin: Option<[u8; 32]>,
+) -> WinResult<Negotiated> {
+    let stream = connect()?;
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| io_error("rdp_connect", "set RDP read timeout", error))?;
+    stream
+        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| io_error("rdp_connect", "set RDP write timeout", error))?;
+    let client_addr = stream
+        .local_addr()
+        .map_err(|error| io_error("rdp_connect", "read RDP client address", error))?;
+    let mut framed = ironrdp_blocking::Framed::new(stream);
+    connector.client_addr = client_addr;
+    ironrdp_blocking::connect_begin(&mut framed, connector)
+        .map_err(|error| io_error("rdp_negotiation", "RDP negotiation failed", error))?;
+    let selected = match connector.state {
+        ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => selected_protocol,
+        _ => {
+            return Err(backend_error(
+                "rdp_negotiation",
+                "IronRDP did not stop at the TLS security upgrade",
+            ));
+        }
+    };
+    if !selected.intersects(
+        ironrdp::pdu::nego::SecurityProtocol::HYBRID
+            | ironrdp::pdu::nego::SecurityProtocol::HYBRID_EX,
+    ) {
+        return Err(backend_error(
+            "rdp_nla_required",
+            "RDP server did not select CredSSP/NLA",
+        ));
+    }
+    let stream = framed.into_inner_no_leftover();
+    let observed = Arc::new(Mutex::new(None));
+    let verifier = pf_seats::pin::PinVerify::with_observed(expected_pin, observed.clone());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| io_error("rdp_tls", "select TLS protocol versions", error))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    tls_config.resumption = rustls::client::Resumption::disabled();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .map_err(|error| io_error("rdp_tls", "build TLS server name", error))?;
+    let mut connection = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
+        .map_err(|error| io_error("rdp_tls", "create TLS connection", error))?;
+    let mut stream = stream;
+    while connection.is_handshaking() {
+        connection
+            .complete_io(&mut stream)
+            .map_err(|error| io_error("rdp_tls", "RDP TLS handshake failed", error))?;
+    }
+    let certificate = connection
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .ok_or_else(|| backend_error("rdp_certificate", "RDP server sent no leaf certificate"))?;
+    let public_key = extract_public_key(certificate.as_ref())?;
+    let observed = *observed.lock().unwrap_or_else(|poison| poison.into_inner());
+    stream
+        .set_read_timeout(Some(ACTIVE_READ_TIMEOUT))
+        .map_err(|error| io_error("rdp_connect", "set active RDP timeout", error))?;
+    let tls = rustls::StreamOwned::new(connection, stream);
+    Ok((ironrdp_blocking::Framed::new(tls), public_key, observed))
+}
+
+fn extract_public_key(certificate: &[u8]) -> WinResult<Vec<u8>> {
+    let certificate = x509_cert::Certificate::from_der(certificate)
+        .map_err(|error| io_error("rdp_certificate", "parse RDP leaf certificate", error))?;
+    certificate
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| backend_error("rdp_certificate", "RDP leaf public key is not byte-aligned"))
+}
+
+fn active_loop(result: ConnectionResult, mut framed: RdpFramed) -> WinResult<()> {
+    let mut image = DecodedImage::new(
+        PixelFormat::RgbA32,
+        result.desktop_size.width,
+        result.desktop_size.height,
+    );
+    let mut stage = ActiveStageBuilder {
+        static_channels: result.static_channels,
+        user_channel_id: result.user_channel_id,
+        io_channel_id: result.io_channel_id,
+        message_channel_id: result.message_channel_id,
+        share_id: result.share_id,
+        compression_type: result.compression_type,
+        enable_server_pointer: result.enable_server_pointer,
+        pointer_software_rendering: result.pointer_software_rendering,
+    }
+    .build();
+    loop {
+        let (action, payload) = match framed.read_pdu() {
+            Ok(frame) => frame,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(io_error("rdp_disconnected", "read active RDP PDU", error));
+            }
+        };
+        let outputs = stage
+            .process(&mut image, action, &payload)
+            .map_err(|error| io_error("rdp_protocol", "process active RDP PDU", error))?;
+        for output in outputs {
+            match output {
+                ActiveStageOutput::ResponseFrame(frame) => {
+                    framed.write_all(&frame).map_err(|error| {
+                        io_error("rdp_protocol", "write active RDP response", error)
+                    })?
+                }
+                ActiveStageOutput::Terminate(reason) => {
+                    return Err(backend_error(
+                        "rdp_disconnected",
+                        format!("RDP server ended the managed session: {reason:?}"),
+                    ));
+                }
+                ActiveStageOutput::DeactivateAll => {
+                    return Err(backend_error(
+                        "rdp_deactivated",
+                        "RDP server deactivated the managed session",
+                    ));
+                }
+                // No sideband UDP transport and no use for the server's RTT
+                // figures: the keeper only has to hold the session open.
+                ActiveStageOutput::GraphicsUpdate(_)
+                | ActiveStageOutput::PointerDefault
+                | ActiveStageOutput::PointerHidden
+                | ActiveStageOutput::PointerPosition { .. }
+                | ActiveStageOutput::PointerBitmap(_)
+                | ActiveStageOutput::MultitransportRequest(_)
+                | ActiveStageOutput::AutoDetect(_) => {}
+            }
+        }
+    }
+}
+
+struct NoExternalNetwork;
+
+impl connector::sspi::network_client::NetworkClient for NoExternalNetwork {
+    fn send(
+        &self,
+        _request: &connector::sspi::generator::NetworkRequest,
+    ) -> connector::sspi::Result<Vec<u8>> {
+        Err(connector::sspi::Error::new(
+            connector::sspi::ErrorKind::NoAuthenticatingAuthority,
+            "external Kerberos transport is disabled for local seat login",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refused, ConnectorErrorKind};
+    use ironrdp::connector::sspi::{self, credssp};
+
+    /// A status the server sends back in CredSSP is a refusal; a local or transport error is not.
+    #[test]
+    fn only_the_servers_refusal_ends_the_keeper() {
+        let answer = credssp::TsRequest {
+            error_code: Some(credssp::NStatusCode::LOGON_FAILURE),
+            ..Default::default()
+        };
+        let status = answer.check_error().unwrap_err();
+        assert!(refused(&ConnectorErrorKind::Credssp(status)));
+        assert!(refused(&ConnectorErrorKind::AccessDenied));
+        let local = sspi::Error::new(sspi::ErrorKind::InternalError, "local");
+        assert!(!refused(&ConnectorErrorKind::Credssp(local)));
+        assert!(!refused(&ConnectorErrorKind::Custom));
+        assert!(!refused(&ConnectorErrorKind::General));
+    }
+}

@@ -1,0 +1,72 @@
+---
+title: How It Works
+description: The ideas behind Punktfunk — a virtual display per client, how frames reach the wire, the two protocols, and pairing.
+---
+
+What happens between your host and your device, in the words the rest of these docs use.
+
+## A virtual display, sized to your device
+
+When a client connects, the host creates a **virtual display** at the client's resolution and
+refresh rate, streams it, and removes it when the client leaves. Apps and games treat it as a real
+monitor, but no physical screen or dummy plug is involved. Two clients get two displays, each at its
+own mode.
+
+| Host | How the display is made |
+|---|---|
+| **GNOME** | A virtual monitor from Mutter's screen-cast API |
+| **KDE Plasma** | A virtual output from KWin |
+| **gamescope** (SteamOS, Bazzite) | A gamescope session at the client's mode |
+| **[Hyprland](/docs/hyprland)** | A headless output added with `hyprctl` |
+| **[niri](/docs/niri)** | A virtual output created over niri's IPC; needs the biri fork |
+| **[Umbriel](/docs/umbriel)** | A virtual output created over Umbriel's IPC |
+| **[sway, scroll](/docs/sway)** | A headless output added over the compositor's IPC |
+| **Windows** | Punktfunk's own display driver, which also shows the secure desktop (UAC, lock screen) |
+
+You can stream one of your real monitors instead — see
+[Stream a real monitor](/docs/stream-a-monitor).
+
+## From screen to wire
+
+Captured frames stay on the GPU all the way into the encoder. Which encoder runs depends on the GPU:
+
+| GPU | Linux | Windows |
+|---|---|---|
+| **NVIDIA** | NVENC | NVENC |
+| **AMD** | Vulkan Video for HEVC and AV1, VAAPI for H.264 | AMF |
+| **Intel** | Vulkan Video for HEVC and AV1, VAAPI for H.264 | QSV |
+| **Other** | Software H.264, only if you set `PUNKTFUNK_ENCODER=software` | Media Foundation |
+
+Client and host then agree on a codec: the one the client asks for if the host can encode it,
+otherwise **HEVC**, then **AV1**, then **H.264**, the software encoder's only codec.
+**[PyroWave](/docs/pyrowave)** runs when you pick it, on a wired link. **[HDR](/docs/hdr)** works
+where the host's capture, its encoder and your client all support it. The full breakdown is in the
+[Support matrix](/docs/support-matrix).
+
+## Two protocols
+
+- **punktfunk/2** — Punktfunk's own protocol: control, video and audio over one encrypted QUIC
+  port, with forward error correction on the video. The [native clients](/docs/clients) (Apple, Android, Linux,
+  Windows) use it. It is always on.
+- **GameStream** — the protocol [Moonlight](/docs/moonlight) speaks, so any Moonlight client
+  connects. It is off until you turn on **GameStream** in **Host**, and it pairs over
+  plain HTTP, so use it on a [trusted network](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)
+  only.
+
+Both run in one host process.
+
+## Pairing and trust
+
+The first time a device connects, you pair it: approve it in the web console, or type the PIN the
+host shows. After that it reconnects on its own, on a pinned identity — no account, no cloud. See
+[Pairing & Trust](/docs/pairing).
+
+## Finding hosts
+
+Hosts announce themselves on your local network, so the native clients and Moonlight list them
+without an IP address.
+
+## Several devices at once
+
+A host streams to several clients at the same time, each on its own display at its own mode. See
+[Multiple devices](/docs/configuration#multiple-devices-at-once).

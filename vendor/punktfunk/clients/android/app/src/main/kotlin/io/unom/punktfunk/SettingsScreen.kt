@@ -1,0 +1,1901 @@
+package io.unom.punktfunk
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.TouchApp
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.VerticalDivider
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import io.unom.punktfunk.kit.DeviceGyro
+import io.unom.punktfunk.components.SCREEN_MARGIN
+import io.unom.punktfunk.components.ScreenTitle
+import io.unom.punktfunk.kit.R
+import io.unom.punktfunk.kit.Shortcuts
+import io.unom.punktfunk.kit.SlotId
+import io.unom.punktfunk.kit.VideoDecoders
+import io.unom.punktfunk.kit.asciiDigits
+import io.unom.punktfunk.kit.deviceBodyVibrator
+import io.unom.punktfunk.kit.link.StartIn
+import io.unom.punktfunk.kit.link.StartScreen
+import io.unom.punktfunk.kit.security.IdentityHolder
+import io.unom.punktfunk.kit.security.KnownHostStore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.withContext
+
+/**
+ * Stream settings, organised as an iOS-Settings / Android-system-settings style list of category
+ * subpages. On a phone the category list pushes to a full-screen detail; on a tablet / large screen
+ * it becomes a two-pane list-detail (the list stays on the left, the detail on the right). Edits
+ * persist immediately; [onBack] returns to the connect screen.
+ *
+ * **Structure mirrors the desktop/Apple settings revamp** ([SettingsCategory], and the Windows
+ * client's `app/settings.rs`), so every client reads the same way: General = session/app behaviour,
+ * Display = everything about the picture, Input = touch/keyboard/mouse, Audio, Controllers, About.
+ * Each field carries its explanation DIRECTLY under it (the `described()` idiom — see
+ * [SettingDropdown]'s `caption` and [ToggleRow]'s `subtitle`) rather than as loose paragraphs
+ * floating between controls; the only form-level notes are the "applies from the next session"
+ * footers, one per affected category.
+ *
+ * **One settings UI, not two.** The scope switcher on top edits either the global defaults
+ * ([onChange], the base layer every preset inherits from) or one preset's overrides — the same
+ * rows either way, so a preset can never drift from the surface it overrides. In preset scope
+ * only presetable settings render, every row shows the EFFECTIVE value, and a row the preset
+ * overrides carries a marker and a reset. See [SettingsOverlay] for the model.
+ */
+@Composable
+fun SettingsScreen(
+    initial: Settings,
+    onChange: (Settings) -> Unit,
+    onBack: () -> Unit,
+    /**
+     * Seeds the pushed detail page. The live app always starts on the category list (null); the
+     * screenshot harness passes a category to capture one, the way the GTK client's
+     * `PUNKTFUNK_SHOT_SETTINGS_SCOPE` seeds its scope.
+     */
+    initialCategory: SettingsCategory? = null,
+    /** Seeds the scope the same way, for a screenshot of a preset being edited. */
+    initialPresetId: String? = null,
+) {
+    var globals by remember { mutableStateOf(initial) }
+    val context = LocalContext.current
+    val presetStore = remember { PresetStore(context) }
+    val hostStore = remember { KnownHostStore(context) }
+    var presets by remember { mutableStateOf(presetStore.all()) }
+    // Which layer is being edited: null = the global defaults, else a preset id. Survives rotation
+    // but not a trip out of Settings — coming back should land on the defaults, which is what the
+    // host cards actually connect with unless they say otherwise.
+    var scopeId by rememberSaveable { mutableStateOf(initialPresetId) }
+    // A preset deleted from under the scope (or a store that never had it) falls back to defaults.
+    val active = scopeId?.let { id -> presets.firstOrNull { it.id == id } }
+    if (scopeId != null && active == null) scopeId = null
+
+    var showLicenses by remember { mutableStateOf(false) }
+    var showShortcuts by remember { mutableStateOf(false) }
+    var showControllers by remember { mutableStateOf(false) }
+    var showQuickActions by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<EditIntent?>(null) }
+    var deleting by remember { mutableStateOf<StreamPreset?>(null) }
+
+    // Every row renders the EFFECTIVE value: the globals with this preset's overrides on top, so a
+    // row the preset doesn't override reads as the live global — and keeps following it.
+    val s = globals.effectiveFor(active)
+
+    /**
+     * The scope an edit writes to, resolved AT THE EDIT rather than closed over at composition.
+     *
+     * [update] and [resetField] reach the rows as `::update` / `::resetField` — callable references,
+     * and two of those compare EQUAL however different the scope they captured. Compose therefore
+     * sees an unchanged callback and skips [CategoryDetail] on a scope switch that doesn't move any
+     * value on screen — which is the ordinary case, since a preset inherits the globals until it
+     * overrides something. The row then kept calling the reference it was first handed and wrote
+     * into the scope the user had just LEFT: edit a default, switch to a preset, edit the same row
+     * — the globals move again and the preset records nothing; switch back and the next edit lands
+     * on the preset. Reading the live state here is what makes the write follow the chips.
+     */
+    fun scopePreset(): StreamPreset? = scopeId?.let { id -> presets.firstOrNull { it.id == id } }
+
+    /**
+     * One control commits [next], naming its own [field]. In preset scope it pins that field when
+     * the value it showed changed — to today's global value too, which is the pin; re-picking what
+     * it shows writes nothing, and a field no preset carries changes nothing.
+     */
+    fun update(field: String, next: Settings) {
+        val preset = scopePreset()
+        if (preset == null) {
+            globals = next
+            onChange(next)
+            return
+        }
+        // A skipped row shows what a fresh one would (that is WHY it skipped), so the effective
+        // settings recomputed here are the ones it rendered.
+        val shown = globals.effectiveFor(preset)
+        if (SettingsFields.controlRows(field).all { it.get(shown) == it.get(next) }) return
+        presetStore.save(preset.copy(overrides = preset.overrides.pin(field, next)))
+        presets = presetStore.all()
+    }
+
+    fun resetField(field: String) {
+        val preset = scopePreset() ?: return
+        presetStore.save(preset.copy(overrides = preset.overrides.clear(field)))
+        presets = presetStore.all()
+    }
+
+    /** Every default back to a fresh install's. Only the defaults scope offers it. */
+    fun resetAll() {
+        globals = globals.reset(isTvDevice(context))
+        onChange(globals)
+    }
+
+    /** HDR on for a display with no headroom, on the player's yes to the warning. */
+    fun allowHdrWithoutHeadroom() {
+        val preset = scopePreset()
+        globals = globals.allowingHdrWithoutHeadroom(inPreset = preset != null)
+        onChange(globals)
+        if (preset != null) update("hdr_enabled", globals.effectiveFor(preset).copy(hdrEnabled = true))
+    }
+
+    // Mic uplink — turning it on requests RECORD_AUDIO; if denied, the toggle stays off.
+    val micLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> update("mic_enabled", s.copy(micEnabled = granted)) }
+    val onMicChange: (Boolean) -> Unit = { on ->
+        when {
+            !on -> update("mic_enabled", s.copy(micEnabled = false))
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED -> update("mic_enabled", s.copy(micEnabled = true))
+            else -> micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    // Deep sub-screens replace the whole settings surface (they carry their own back).
+    if (showLicenses) {
+        LicensesScreen(onBack = { showLicenses = false })
+        return
+    }
+    if (showShortcuts) {
+        ShortcutsScreen(
+            settings = s,
+            onChange = { update("shortcuts", s.copy(shortcuts = it)) },
+            // Reset drops a preset's own shortcuts, and writes the defaults' empty blob otherwise.
+            onReset = {
+                if (active != null) resetField("shortcuts") else update("shortcuts", s.copy(shortcuts = ""))
+            },
+            onBack = { showShortcuts = false },
+        )
+        return
+    }
+    if (showControllers) {
+        ControllersScreen(gamepadSetting = s.gamepad, onBack = { showControllers = false })
+        return
+    }
+    if (showQuickActions) {
+        QuickActionsScreen(
+            blob = s.overlayActions,
+            onChange = { update("overlay_actions", s.copy(overlayActions = it)) },
+            // Reset drops the override in preset scope (design §3.3) and clears the global
+            // otherwise; an empty blob is the platform default.
+            onReset = {
+                if (active != null) {
+                    resetField("overlay_actions")
+                } else {
+                    update("overlay_actions", s.copy(overlayActions = ""))
+                }
+            },
+            onBack = { showQuickActions = false },
+            overridden = active?.overrides?.overridden()?.contains("overlay_actions") == true,
+        )
+        return
+    }
+
+    // Selected category persists across rotation (stored by name — null = the bare list on a phone).
+    var selectedName by rememberSaveable { mutableStateOf(initialCategory?.name) }
+    val categories = SettingsCategory.entries.filter { active == null || it.presetable }
+    val selected = selectedName
+        ?.let { n -> categories.firstOrNull { it.name == n } }
+
+    // Two panes from 640 dp: the list beside the detail. Below that the list pushes to the detail.
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val twoPane = maxWidth >= 640.dp
+        Column(Modifier.fillMaxSize()) {
+            // The tab's title, where every tab has it. On a phone a category page takes its place,
+            // with the way back to the list.
+            val pushed = selected.takeIf { !twoPane }
+            ScreenTitle(
+                stringResource(pushed?.title ?: R.string.prefs_title),
+                onBack = if (pushed != null) ({ selectedName = null }) else null,
+            )
+            PresetScopeChips(
+                presets = presets,
+                selectedId = active?.id,
+                onSelect = { id ->
+                    scopeId = id
+                    // About has no presetable rows at all; don't strand the pane on it.
+                    if (id != null && selected?.presetable == false) selectedName = null
+                },
+                onNew = { editing = EditIntent.New(nextAccent(presets)) },
+                onEdit = { p -> editing = EditIntent.Existing(p) },
+                onDuplicate = { p ->
+                    val copy = newPreset(uniqueName(context, presetStore, p.name), p.accent)
+                        .copy(overrides = p.overrides)
+                    presetStore.save(copy)
+                    presets = presetStore.all()
+                    scopeId = copy.id
+                },
+                onDelete = { p -> deleting = p },
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            if (active != null) {
+                Text(
+                    stringResource(R.string.prefs_scope_preset_hint, active.name),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp),
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            HorizontalDivider()
+
+            CompositionLocalProvider(
+                LocalSettingsScope provides SettingsScopeState(
+                    presetScope = active != null,
+                    overridden = active?.overrides?.overridden() ?: emptySet(),
+                    onReset = ::resetField,
+                    showAdvanced = globals.showAdvanced,
+                    onShowAdvanced = { on ->
+                        globals = globals.copy(showAdvanced = on)
+                        onChange(globals)
+                    },
+                ),
+            ) {
+                CategoryPanes(
+                    categories = categories,
+                    selected = selected,
+                    twoPane = twoPane,
+                    onSelect = { selectedName = it?.name },
+                    onBack = onBack,
+                ) { cat ->
+                    // Keyed on the scope: switching chips rebuilds the page rather than recomposing
+                    // it in place. Correctness no longer depends on it (see [scopePreset]), but a
+                    // row's own `remember` is per-scope state too — "Custom…" picked while editing
+                    // a preset has no business still being picked over on the defaults.
+                    key(active?.id) {
+                        CategoryDetail(
+                            category = cat,
+                            settings = s,
+                            onChange = ::update,
+                            context = context,
+                            onMicChange = onMicChange,
+                            onHdrWithoutHeadroom = ::allowHdrWithoutHeadroom,
+                            onOpenControllers = { showControllers = true },
+                            onOpenQuickActions = { showQuickActions = true },
+                            onOpenLicenses = { showLicenses = true },
+                            onOpenShortcuts = { showShortcuts = true },
+                            onResetAll = ::resetAll,
+                            titled = twoPane,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    PresetDialogs(
+        editing = editing,
+        deleting = deleting,
+        presetStore = presetStore,
+        hostStore = hostStore,
+        onSaved = { id -> presets = presetStore.all(); scopeId = id; editing = null },
+        onDeleted = { presets = presetStore.all(); scopeId = null; deleting = null },
+        onDismiss = { editing = null; deleting = null },
+    )
+}
+
+/**
+ * The category list beside the detail page ([twoPane]) or in front of it. Two-pane: a side list
+ * with a cross-fading detail, never an empty one. Compact: the list pushes to a full-screen
+ * detail and back with a horizontal slide, and the screen's title follows.
+ */
+@Composable
+private fun CategoryPanes(
+    categories: List<SettingsCategory>,
+    selected: SettingsCategory?,
+    twoPane: Boolean,
+    onSelect: (SettingsCategory?) -> Unit,
+    onBack: () -> Unit,
+    detail: @Composable (SettingsCategory) -> Unit,
+) {
+    Box(Modifier.fillMaxSize()) {
+        LaunchedEffect(twoPane, categories) {
+            if (twoPane && selected == null) onSelect(categories.first())
+        }
+        if (twoPane) {
+            BackHandler(onBack = onBack)
+            Row(Modifier.fillMaxSize()) {
+                CategoryList(
+                    categories = categories,
+                    selected = selected,
+                    twoPane = true,
+                    onSelect = onSelect,
+                    modifier = Modifier.width(300.dp).fillMaxHeight(),
+                )
+                VerticalDivider()
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    AnimatedContent(
+                        targetState = selected ?: categories.first(),
+                        transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
+                        label = "SettingsPane",
+                    ) { cat -> detail(cat) }
+                }
+            }
+        } else {
+            BackHandler { if (selected != null) onSelect(null) else onBack() }
+            AnimatedContent(
+                targetState = selected,
+                transitionSpec = {
+                    if (targetState != null) {
+                        slideInHorizontally { it } + fadeIn() togetherWith
+                            slideOutHorizontally { -it } + fadeOut()
+                    } else {
+                        slideInHorizontally { -it } + fadeIn() togetherWith
+                            slideOutHorizontally { it } + fadeOut()
+                    }
+                },
+                label = "SettingsPush",
+            ) { sel ->
+                if (sel == null) {
+                    CategoryList(
+                        categories = categories,
+                        selected = null,
+                        twoPane = false,
+                        onSelect = onSelect,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    detail(sel)
+                }
+            }
+        }
+    }
+}
+
+/** The preset editor and the delete confirmation, whichever intent is pending. */
+@Composable
+private fun PresetDialogs(
+    editing: EditIntent?,
+    deleting: StreamPreset?,
+    presetStore: PresetStore,
+    hostStore: KnownHostStore,
+    onSaved: (id: String) -> Unit,
+    onDeleted: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    editing?.let { intent ->
+        val existing = (intent as? EditIntent.Existing)?.preset
+        PresetEditorDialog(
+            title = stringResource(if (existing == null) R.string.preset_new_title else R.string.preset_edit_title),
+            confirmLabel = stringResource(if (existing == null) R.string.common_create else R.string.common_save),
+            initialName = existing?.name.orEmpty(),
+            initialAccent = existing?.accent ?: (intent as? EditIntent.New)?.accent,
+            creating = existing == null,
+            taken = { presetStore.nameTaken(it, except = existing?.id) },
+            onConfirm = { name, accent, secondScreen ->
+                val saved = existing?.copy(name = name, accent = accent)
+                    ?: if (secondScreen) secondScreenPreset(name, accent) else newPreset(name, accent)
+                presetStore.save(saved)
+                onSaved(saved.id)
+            },
+            onDismiss = onDismiss,
+        )
+    }
+    deleting?.let { preset ->
+        val hosts = hostStore.all()
+        DeletePresetDialog(
+            preset = preset,
+            boundHosts = hosts.count { it.presetId == preset.id },
+            pinnedCards = hosts.count { preset.id in it.pinnedPresetIds },
+            onConfirm = {
+                presetStore.delete(preset.id)
+                // Bindings and pins are left dangling on purpose: they resolve to "no preset" and
+                // to "no card", which is exactly right, and rewriting every host record here would
+                // be a second write pass over data the user didn't ask us to touch.
+                onDeleted()
+            },
+            onDismiss = onDismiss,
+        )
+    }
+}
+
+/** What the preset editor is for — a fresh preset (with the colour creation picked out for it),
+ * or one that already exists. */
+private sealed interface EditIntent {
+    data class New(val accent: String) : EditIntent
+    data class Existing(val preset: StreamPreset) : EditIntent
+}
+
+/** "Work" → "Work copy" → "Work copy 2" — the first name Duplicate can actually save. */
+private fun uniqueName(context: android.content.Context, store: PresetStore, base: String): String {
+    val first = context.getString(R.string.preset_copy_name, base)
+    if (!store.nameTaken(first)) return first
+    var n = 2
+    while (store.nameTaken(context.getString(R.string.preset_copy_name_numbered, base, n))) n++
+    return context.getString(R.string.preset_copy_name_numbered, base, n)
+}
+
+// ---- Scope plumbing ----------------------------------------------------------------------------
+
+/**
+ * What the rows need to know about the layer being edited. Carried as a composition local rather
+ * than threaded through every category and row: the rows are the same rows in both scopes, and the
+ * scope only decides whether tier-G rows render at all and whether a row wears an override marker.
+ * [showAdvanced] is the device-wide tier switch, written to the globals from either scope.
+ */
+private class SettingsScopeState(
+    val presetScope: Boolean,
+    val overridden: Set<String>,
+    val onReset: (String) -> Unit,
+    val showAdvanced: Boolean = false,
+    val onShowAdvanced: (Boolean) -> Unit = {},
+)
+
+private val LocalSettingsScope = compositionLocalOf {
+    SettingsScopeState(presetScope = false, overridden = emptySet(), onReset = {})
+}
+
+/**
+ * Wraps rows that are facts about THIS DEVICE or this app rather than about a stream — the console
+ * UI toggle, the library browser, auto-wake, the controller diagnostics, rumble mirroring, SC2
+ * capture (design §3, tiers G and H). They never belong to a preset, so in preset scope they
+ * simply don't render.
+ */
+@Composable
+private fun DeviceScopeOnly(content: @Composable () -> Unit) {
+    if (!LocalSettingsScope.current.presetScope) content()
+}
+
+/**
+ * A category's advanced rows: their own group while Show advanced is on or the preset overrides one
+ * of [fields]; otherwise one row naming how many hold a changed value, which shows them. Nothing
+ * when none changed.
+ */
+@Composable
+private fun AdvancedGroup(
+    changed: Int,
+    fields: Set<String> = emptySet(),
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scope = LocalSettingsScope.current
+    if (scope.showAdvanced || fields.any { it in scope.overridden }) {
+        SettingsGroup(stringResource(R.string.prefs_advanced), content = content)
+    } else if (changed > 0 && !scope.presetScope) {
+        SettingsGroup {
+            ClickableRow(
+                title = pluralStringResource(R.plurals.prefs_advanced_changed, changed, changed),
+                subtitle = stringResource(R.string.android_prefs_show_advanced_settings),
+                onClick = { scope.onShowAdvanced(true) },
+            )
+        }
+    }
+}
+
+/** How many of [flags] are set — an advanced group's changed count. */
+private fun changedCount(vararg flags: Boolean) = flags.count { it }
+
+/**
+ * The accent marker and reset a row wears when the selected preset overrides it. Nothing renders
+ * in the defaults scope, or on a row the preset inherits — an inherited row shows the live global
+ * value in the ordinary quiet style, which is the whole point of inherit-by-default.
+ */
+@Composable
+private fun OverrideBadge(field: String?) {
+    val scope = LocalSettingsScope.current
+    if (!scope.presetScope || field == null || field !in scope.overridden) return
+    // One compact line. A `TextButton` here carried its own 48dp touch target and dwarfed both the
+    // control it annotates and the caption under it; the reset keeps a generous padded hit area
+    // instead, which is the right trade for a secondary action inside a dense settings list.
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        // No vertical padding of its own: this row is the FIRST thing in a card whose column
+        // already pads 16dp, and anything added here reads as double the gap every other row has.
+        // The bottom padding is the badge's tie to the control it annotates — deliberately tighter
+        // than the gap down to the caption, so the marker groups upward with its own field.
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+    ) {
+        AccentDot(MaterialTheme.colorScheme.primary, size = 6)
+        Text(
+            stringResource(R.string.prefs_overridden),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(start = 6.dp).weight(1f),
+        )
+        Text(
+            stringResource(R.string.common_reset),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { scope.onReset(field) }
+                .padding(horizontal = 10.dp, vertical = 2.dp),
+        )
+    }
+}
+
+// ---- Categories --------------------------------------------------------------------------------
+
+/**
+ * The top-level settings groups — each opens its own subpage (list on phone, split on tablet).
+ * The map and its order are the cross-client one (Apple's `SettingsCategory`, the Windows
+ * NavigationView, the GTK pages): General, Display, Input, Audio, Controllers, About.
+ *
+ * [presetable] is false for a category with no presetable rows at all — it isn't offered in
+ * preset scope, rather than opening onto an empty page.
+ */
+enum class SettingsCategory(
+    @StringRes val title: Int,
+    val icon: ImageVector,
+    internal val presetable: Boolean = true,
+) {
+    General(R.string.prefs_category_general, Icons.Filled.Tune),
+    Display(R.string.prefs_category_display, Icons.Filled.Tv),
+    Input(R.string.prefs_category_input, Icons.Filled.TouchApp),
+    Audio(R.string.prefs_category_audio, Icons.AutoMirrored.Filled.VolumeUp),
+    Controllers(R.string.prefs_category_controllers, Icons.Filled.SportsEsports),
+    About(R.string.prefs_category_about, Icons.Filled.Info, presetable = false),
+}
+
+/** The category list: the settings root. It highlights the [selected] row when it drives a detail pane. */
+@Composable
+private fun CategoryList(
+    categories: List<SettingsCategory>,
+    selected: SettingsCategory?,
+    twoPane: Boolean,
+    onSelect: (SettingsCategory) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        categories.forEach { cat ->
+            val highlighted = twoPane && selected == cat
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(if (highlighted) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                    .clickable { onSelect(cat) }
+                    .padding(horizontal = 14.dp, vertical = 15.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    cat.icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(end = 16.dp),
+                )
+                Text(stringResource(cat.title), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                if (!twoPane) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One category's controls. [titled] heads them with the category's name: a tablet's pane, where
+ * the screen's title stays Settings. On a phone the screen's title names the category instead.
+ */
+@Composable
+private fun CategoryDetail(
+    category: SettingsCategory,
+    settings: Settings,
+    onChange: (String, Settings) -> Unit,
+    context: android.content.Context,
+    onMicChange: (Boolean) -> Unit,
+    onHdrWithoutHeadroom: () -> Unit,
+    onOpenControllers: () -> Unit,
+    onOpenQuickActions: () -> Unit,
+    onOpenLicenses: () -> Unit,
+    onOpenShortcuts: () -> Unit,
+    onResetAll: () -> Unit,
+    titled: Boolean,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = SCREEN_MARGIN, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
+    ) {
+        if (titled) Text(stringResource(category.title), style = MaterialTheme.typography.headlineMedium)
+        when (category) {
+            SettingsCategory.General -> GeneralSettings(settings, onChange, onResetAll)
+            SettingsCategory.Display -> DisplaySettings(settings, onChange, context, onHdrWithoutHeadroom)
+            SettingsCategory.Input -> InputSettings(settings, onChange, onOpenQuickActions, onOpenShortcuts)
+            SettingsCategory.Audio -> AudioSettings(settings, onChange, onMicChange)
+            SettingsCategory.Controllers -> ControllerSettings(settings, onChange, onOpenControllers)
+            SettingsCategory.About -> AboutSettings(context, onOpenLicenses)
+        }
+    }
+}
+
+@Composable
+private fun GeneralSettings(s: Settings, update: (String, Settings) -> Unit, onResetAll: () -> Unit) {
+    val context = LocalContext.current
+    // Turning the keep-alive on asks for notifications, because the ongoing notification is how
+    // the session announces itself and the only way to end it from outside the app. A refusal
+    // keeps the setting: the keep-alive still works, it just has nothing on screen.
+    val noteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {}
+    DeviceScopeOnly {
+        SettingsGroup(stringResource(R.string.prefs_group_session)) {
+            ToggleRow(
+                title = stringResource(R.string.player_auto_wake),
+                subtitle = stringResource(R.string.player_auto_wake_hint),
+                checked = s.autoWakeEnabled,
+                onCheckedChange = { on -> update("auto_wake", s.copy(autoWakeEnabled = on)) },
+            )
+            // Hidden on a TV, where the notification the End button lives on has nowhere to
+            // appear: a session left running would be one nobody outside the app can stop.
+            if (!isTvDevice(context)) {
+                ToggleRow(
+                    title = stringResource(R.string.player_background_keep_alive),
+                    subtitle = stringResource(R.string.player_background_keep_alive_hint),
+                    checked = s.backgroundKeepAlive,
+                    onCheckedChange = { on ->
+                        if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            noteLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        update("background_keep_alive", s.copy(backgroundKeepAlive = on))
+                    },
+                )
+                // Only decides anything while the switch above is on, so it is hidden rather than
+                // dimmed when it isn't — the same rule the console-UI group follows below.
+                if (s.backgroundKeepAlive) {
+                    SettingDropdown(
+                        label = stringResource(R.string.player_background_timeout_minutes),
+                        options = BACKGROUND_TIMEOUT_OPTIONS.map { m ->
+                            m to pluralStringResource(R.plurals.player_background_timeout_minutes_count, m, m)
+                        },
+                        selected = s.backgroundTimeoutMinutes,
+                        caption = stringResource(R.string.player_background_timeout_minutes_hint),
+                    ) { v -> update("background_timeout_minutes", s.copy(backgroundTimeoutMinutes = v)) }
+                }
+            }
+        }
+    }
+    SettingsGroup(stringResource(R.string.prefs_group_statistics)) {
+        SettingDropdown(
+            label = stringResource(R.string.player_stats_verbosity),
+            options = STATS_VERBOSITY_OPTIONS.worded(),
+            selected = s.statsVerbosity,
+            field = "stats_verbosity",
+            caption = stringResource(R.string.player_stats_verbosity_hint) +
+                s.shortcutHint(Shortcuts.Action.Slot(SlotId.Stats), Shortcuts.Device.PAD)
+                    ?.let { " " + stringResource(R.string.player_stats_verbosity_cycle_touch_hint, it) }.orEmpty(),
+        ) { v -> update("stats_verbosity", s.copy(statsVerbosity = v)) }
+        DeviceScopeOnly {
+            ClickableRow(
+                title = stringResource(R.string.player_stats_docs_link),
+                subtitle = "docs.punktfunk.unom.io/docs/stats",
+            ) {
+                runCatching {
+                    context.startActivity(
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("https://docs.punktfunk.unom.io/docs/stats"),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+    DeviceScopeOnly {
+        SettingsGroup(stringResource(R.string.prefs_group_library)) {
+            SettingDropdown(
+                label = stringResource(R.string.player_start_in),
+                options = START_IN_OPTIONS.worded(),
+                selected = StartIn.parse(s.startIn).stored,
+                caption = startInCaption(s, LocalContext.current),
+            ) { v -> update("start_in", s.copy(startIn = v)) }
+        }
+        // The footer is null on every device where the console works, so it costs nothing there —
+        // and on the ones where it doesn't, it is the only place the app admits that this switch
+        // is being overruled. See `SkiaConsole.unavailable`.
+        SettingsGroup(
+            stringResource(R.string.prefs_group_interface),
+            footer = io.unom.punktfunk.console.SkiaConsole.unavailable(),
+        ) {
+            ToggleRow(
+                title = stringResource(R.string.player_gamepad_ui_enabled),
+                subtitle = stringResource(R.string.player_gamepad_ui_enabled_hint),
+                checked = s.gamepadUiEnabled,
+                onCheckedChange = { on -> update("gamepad_ui_enabled", s.copy(gamepadUiEnabled = on)) },
+            )
+            // Only decides anything while the switch above is on, so it is HIDDEN rather than
+            // dimmed when it isn't — a picker whose every option changes nothing is worse than
+            // no picker, and this group is short enough that nothing jumps far.
+            if (s.gamepadUiEnabled) {
+                SettingDropdown(
+                    label = stringResource(R.string.player_gamepad_ui_mode),
+                    options = GAMEPAD_UI_MODE_OPTIONS.worded(),
+                    selected = s.gamepadUiMode,
+                    caption = stringResource(R.string.player_gamepad_ui_mode_hint),
+                ) { v -> update("gamepad_ui_mode", s.copy(gamepadUiMode = v)) }
+            }
+        }
+    }
+    // Device-wide, and in both scopes: it changes what these pages list, not a stream.
+    val scope = LocalSettingsScope.current
+    SettingsGroup {
+        ToggleRow(
+            title = stringResource(R.string.player_show_advanced),
+            subtitle = stringResource(R.string.player_show_advanced_hint),
+            checked = scope.showAdvanced,
+            onCheckedChange = scope.onShowAdvanced,
+        )
+    }
+    // The overlay's vocabulary, corner and size and the exit hint: this device's screen (tier G).
+    DeviceScopeOnly {
+        val d = Settings()
+        val corner = s.hudPlacement.ifEmpty { "topLeading" }
+        AdvancedGroup(
+            changed = changedCount(
+                s.advancedStats != d.advancedStats,
+                corner != "topLeading",
+                s.statsScalePct != d.statsScalePct,
+                s.exitHint != d.exitHint,
+            ),
+        ) {
+            ToggleRow(
+                title = stringResource(R.string.player_advanced_stats),
+                subtitle = stringResource(R.string.player_advanced_stats_hint),
+                checked = s.advancedStats,
+                onCheckedChange = { on -> update("advanced_stats", s.copy(advancedStats = on)) },
+            )
+            SettingDropdown(
+                label = stringResource(R.string.player_hud_placement),
+                options = HUD_PLACEMENT_OPTIONS.worded(),
+                selected = corner,
+                caption = stringResource(R.string.player_hud_placement_hint),
+            ) { v -> update("hud_placement", s.copy(hudPlacement = v)) }
+            SettingDropdown(
+                label = stringResource(R.string.player_stats_scale_pct),
+                options = STATS_SCALE_OPTIONS.map { it to stringResource(R.string.common_percent, it) },
+                selected = s.statsScalePct.coerceIn(75, 200),
+                caption = stringResource(R.string.android_stats_scale_pct_hint),
+            ) { v -> update("stats_scale_pct", s.copy(statsScalePct = v)) }
+            ToggleRow(
+                title = stringResource(R.string.player_exit_hint),
+                subtitle = stringResource(R.string.player_exit_hint_hint),
+                checked = s.exitHint,
+                onCheckedChange = { on -> update("exit_hint", s.copy(exitHint = on)) },
+            )
+        }
+        // The page's last row. A preset resets row by row, so only the defaults have it.
+        ResetAllGroup(onResetAll)
+    }
+}
+
+/** Every setting back to a fresh install's, asked first. */
+@Composable
+private fun ResetAllGroup(onReset: () -> Unit) {
+    var asking by remember { mutableStateOf(false) }
+    SettingsGroup {
+        Column(Modifier.fillMaxWidth().clickable { asking = true }) {
+            Text(
+                stringResource(R.string.prefs_reset_all),
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Text(
+                stringResource(R.string.prefs_reset_all_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    if (asking) {
+        PunktfunkDialog(
+            title = stringResource(R.string.prefs_reset_all_title),
+            onDismiss = { asking = false },
+            actions = listOf(
+                DialogAction(stringResource(R.string.common_reset)) {
+                    asking = false
+                    onReset()
+                },
+                DialogAction(stringResource(R.string.common_cancel)) { asking = false },
+            ),
+        ) { PromptText(stringResource(R.string.prefs_reset_all_body)) }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DisplaySettings(
+    s: Settings,
+    update: (String, Settings) -> Unit,
+    context: android.content.Context,
+    onHdrWithoutHeadroom: () -> Unit,
+) {
+    val (nw, nh, nhz) = nativeDisplayMode(context, secondScreen = s.secondScreen)
+    // The safe-area row carries its resolved size the same way the native row does. On a display with
+    // no cutout this equals the native mode — the row stays, honestly showing that it changes nothing
+    // here, rather than silently vanishing on some devices and not others.
+    val (sw, sh, _) = safeDisplayMode(context, secondScreen = s.secondScreen)
+    // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
+    // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
+    // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
+    var customPicked by remember { mutableStateOf(false) }
+    val (panel, panelSafe) = panelScreens(context)
+    val families = remember(panel, panelSafe) { Resolutions.families(panel, panelSafe) }
+    val showCustom = customPicked || s.isCustomResolution(families)
+    var customBitratePicked by remember { mutableStateOf(false) }
+    var customScalePicked by remember { mutableStateOf(false) }
+    HostScreenGroup(s, update)
+    SettingsGroup(stringResource(R.string.prefs_group_resolution)) {
+        // The family the dropdown lists. A chip writes that family's size nearest the current
+        // height, so the dropdown always holds a row of the family it shows.
+        val family = s.resolutionFamily(families)
+        Text(
+            stringResource(R.string.player_resolution_aspect),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        // Wraps rather than scrolls, so no entry hides past a phone's edge.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            families.forEachIndexed { i, a ->
+                FilterChip(
+                    selected = i == family,
+                    onClick = {
+                        customPicked = false
+                        val (w, h) = Resolutions.nearestIn(a, s.height)
+                        update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = w, height = h))
+                    },
+                    label = { Text(a.nameRes?.let { stringResource(it) } ?: a.id) },
+                )
+            }
+        }
+        SettingDropdown(
+            label = stringResource(R.string.player_resolution),
+            options = resolutionOptions(families[family]).map { (w, h) ->
+                (w to h) to when (w) {
+                    0 -> stringResource(R.string.player_resolution_native_size, nw, nh)
+                    SAFE_AREA_MODE -> stringResource(R.string.player_resolution_native_safe_area_size, sw, sh)
+                    else -> "$w × $h"
+                }
+            } +
+                // The (-1, -1) sentinel can't collide with a real size; once a custom size is
+                // stored its label carries the live value, like the native row carries ($nw × $nh).
+                ((-1 to -1) to if (s.isCustomResolution(families)) {
+                    stringResource(R.string.player_resolution_custom_size, s.width, s.height)
+                } else {
+                    stringResource(R.string.player_resolution_custom)
+                }),
+            selected = if (showCustom) -1 to -1 else s.width to s.height,
+            field = SettingsOverlay.FIELD_RESOLUTION,
+            caption = stringResource(R.string.player_resolution_hint),
+        ) { (w, h) ->
+            // ONLY -1 is "Custom…". The other negative value is the safe-area sentinel, which is a
+            // stored mode like any preset — a blanket `w < 0` here would open the custom fields for it
+            // and overwrite it with a concrete size.
+            if (w == -1) {
+                // Seed from the current *effective* size so the fields start from something
+                // sensible (the resolved native mode, not the 0 × 0 placeholder).
+                customPicked = true
+                update(
+                    SettingsOverlay.FIELD_RESOLUTION,
+                    s.copy(width = if (s.width > 0) s.width else nw, height = if (s.height > 0) s.height else nh),
+                )
+            } else {
+                customPicked = false
+                update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = w, height = h))
+            }
+        }
+        if (showCustom) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                ResolutionField(
+                    label = stringResource(R.string.player_resolution_width),
+                    value = s.width,
+                    modifier = Modifier.weight(1f),
+                ) { w ->
+                    val (cw, ch) = Resolutions.custom(w, s.height, s.codec)
+                    update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = cw, height = ch))
+                }
+                ResolutionField(
+                    label = stringResource(R.string.player_resolution_height),
+                    value = s.height,
+                    modifier = Modifier.weight(1f),
+                ) { h ->
+                    val (cw, ch) = Resolutions.custom(s.width, h, s.codec)
+                    update(SettingsOverlay.FIELD_RESOLUTION, s.copy(width = cw, height = ch))
+                }
+            }
+        }
+        SettingDropdown(
+            label = stringResource(R.string.player_refresh_hz),
+            options = REFRESH_OPTIONS.map { hz ->
+                hz to if (hz == 0) {
+                    stringResource(R.string.player_refresh_hz_native_rate, nhz)
+                } else {
+                    stringResource(R.string.common_hz, hz)
+                }
+            },
+            selected = s.hz,
+            field = "refresh_hz",
+            caption = stringResource(R.string.player_refresh_hz_hint),
+        ) { hz -> update("refresh_hz", s.copy(hz = hz)) }
+    }
+
+    // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
+    val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
+    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate's, and
+    // Bitrate offers Automatic or Fixed. The stored rate is kept for the other codecs.
+    val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
+    // The toggle is off and locked without an HDR10 listing. With one but no headroom it works,
+    // and turning it on asks first, once: the picture comes out darker than SDR.
+    val hdrDisplay = remember { displayHdr(context) }
+    val hdrOn = s.hdrOn(hdrDisplay)
+    var hdrWarning by remember { mutableStateOf(false) }
+    SettingsGroup(
+        stringResource(R.string.prefs_group_picture),
+        footer = stringResource(R.string.prefs_applies_next_session),
+    ) {
+        SettingDropdown(
+            label = stringResource(R.string.player_video_fit),
+            options = VIDEO_FIT_OPTIONS.worded(),
+            selected = io.unom.punktfunk.kit.VideoFit.fromName(s.videoFit).wire,
+            field = "video_fit",
+            caption = stringResource(R.string.player_video_fit_hint),
+        ) { fit -> update("video_fit", s.copy(videoFit = fit)) }
+
+        // Custom is read from the stored rate, like the resolution above; the flag only keeps the
+        // field open between picking "Custom…" and typing a number.
+        val showCustomBitrate = !pyrowaveOn && (customBitratePicked || s.isCustomBitrate())
+        if (pyrowaveOn) {
+            val fixed = PyroWaveQuality.FIXED_KBPS
+            SettingDropdown(
+                label = stringResource(R.string.player_bitrate_kbps),
+                options = listOf(
+                    0 to stringResource(R.string.player_bitrate_kbps_automatic),
+                    fixed to stringResource(R.string.player_bitrate_kbps_fixed),
+                ),
+                selected = if (s.bitrateKbps == 0) 0 else fixed,
+                field = "bitrate_kbps",
+                caption = stringResource(R.string.player_bitrate_kbps_pyrowave_hint),
+            ) { kbps ->
+                if ((kbps == 0) != (s.bitrateKbps == 0)) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
+        } else {
+            SettingDropdown(
+                label = stringResource(R.string.player_bitrate_kbps),
+                options = BITRATE_OPTIONS.map { kbps ->
+                    kbps to if (kbps == 0) {
+                        stringResource(R.string.player_bitrate_kbps_automatic)
+                    } else {
+                        stringResource(R.string.common_mbits, bitrateMbits(kbps))
+                    }
+                } + (CUSTOM_BITRATE to if (s.isCustomBitrate()) {
+                    stringResource(
+                        R.string.player_bitrate_kbps_custom_value,
+                        stringResource(R.string.common_mbits, bitrateMbits(s.bitrateKbps)),
+                    )
+                } else {
+                    stringResource(R.string.player_bitrate_kbps_custom)
+                }),
+                selected = if (showCustomBitrate) CUSTOM_BITRATE else s.bitrateKbps,
+                field = "bitrate_kbps",
+                caption = stringResource(R.string.player_bitrate_kbps_hint),
+            ) { kbps ->
+                customBitratePicked = kbps == CUSTOM_BITRATE
+                if (kbps != CUSTOM_BITRATE) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
+        }
+        if (showCustomBitrate) {
+            BitrateField(s.bitrateKbps) { kbps -> update("bitrate_kbps", s.copy(bitrateKbps = kbps)) }
+        }
+
+        ToggleRow(
+            title = stringResource(R.string.player_hdr_enabled),
+            subtitle = stringResource(
+                when (hdrDisplay) {
+                    DisplayHdr.None -> R.string.android_hdr_unsupported_hint
+                    DisplayHdr.NoHeadroom -> R.string.player_hdr_enabled_no_headroom_hint
+                    DisplayHdr.Full -> R.string.player_hdr_enabled_hint
+                },
+            ),
+            checked = hdrOn,
+            enabled = hdrDisplay != DisplayHdr.None,
+            field = "hdr_enabled",
+            onCheckedChange = { on ->
+                if (on && hdrDisplay == DisplayHdr.NoHeadroom && !s.hdrWithoutHeadroom) {
+                    hdrWarning = true
+                } else {
+                    update("hdr_enabled", s.copy(hdrEnabled = on))
+                }
+            },
+        )
+        // The timeline presenter's intent — the Apple client's "Prioritize" pair, same stored
+        // values, so a preset written on one platform means the same thing here.
+        SettingDropdown(
+            label = stringResource(R.string.player_present_priority),
+            options = PRESENT_PRIORITY_OPTIONS.worded(),
+            selected = if (s.presentPriority == "smooth") "smooth" else "latency",
+            field = "present_priority",
+            caption = stringResource(R.string.player_present_priority_hint),
+        ) { v -> update("present_priority", s.copy(presentPriority = v)) }
+        // Only codecs this device can actually decode are offered — a preference the client never
+        // advertises would be a dead setting (see [codecOptionsFor]).
+        val av1Capable = remember { VideoDecoders.decodableCodecBits() and 4 != 0 }
+        // Mirror the Automatic AV1 rule in HostConnect (hardware AV1 AND no partial-frame
+        // support) so the picker says what "Automatic" actually does on THIS device.
+        val autoPrefersAv1 = remember {
+            VideoDecoders.decodableCodecBits() and 4 != 0 && !VideoDecoders.partialFrameCapable()
+        }
+        SettingDropdown(
+            label = stringResource(R.string.player_codec),
+            options = codecOptionsFor(s.codec, av1Capable, pyrowaveCapable).named(),
+            selected = s.codec,
+            field = "codec",
+            caption = if (autoPrefersAv1) {
+                stringResource(R.string.player_codec_hint) + " " +
+                    stringResource(R.string.android_codec_auto_av1_hint)
+            } else {
+                stringResource(R.string.player_codec_hint)
+            },
+        ) { c -> update("codec", s.copy(codec = c)) }
+        if (pyrowaveOn) PyroWaveQualityRow(s, update)
+    }
+
+    SettingsGroup(stringResource(R.string.prefs_group_second_screen)) {
+        ToggleRow(
+            title = stringResource(R.string.player_second_screen),
+            subtitle = stringResource(R.string.player_second_screen_hint),
+            checked = s.secondScreen,
+            field = "android.second_screen",
+            onCheckedChange = { on -> update("android.second_screen", s.copy(secondScreen = on)) },
+        )
+    }
+
+    val d = Settings()
+    val smoothing = s.presentPriority == "smooth"
+    AdvancedGroup(
+        changed = changedCount(
+            smoothing && s.smoothBuffer != d.smoothBuffer,
+            s.renderScale != d.renderScale,
+            s.tenBitSdr != d.tenBitSdr,
+            s.lowLatencyMode != d.lowLatencyMode,
+            s.keepAwake != d.keepAwake,
+            s.compositor != d.compositor,
+        ),
+        fields = setOf(
+            "smooth_buffer", "render_scale", "ten_bit_sdr", "low_latency_mode", "compositor",
+        ),
+    ) {
+        if (smoothing) {
+            SettingDropdown(
+                label = stringResource(R.string.player_smooth_buffer),
+                options = listOf(0 to stringResource(R.string.player_smooth_buffer_automatic)) +
+                    smoothBufferCosts(if (s.hz > 0) s.hz else nhz).map { (frames, ms) ->
+                        frames to pluralStringResource(
+                            R.plurals.player_smooth_buffer_frames_cost, frames, frames, ms,
+                        )
+                    },
+                selected = if (s.smoothBuffer in 1..3) s.smoothBuffer else 0,
+                field = "smooth_buffer",
+                caption = stringResource(R.string.player_smooth_buffer_hint),
+            ) { v -> update("smooth_buffer", s.copy(smoothBuffer = v)) }
+        }
+        // Custom is read from the stored scale, like the bitrate above; the flag only keeps the
+        // field open between picking "Custom…" and typing a percent. A stop is matched in
+        // hundredths, so the stored Float still selects its exact Double key.
+        val scaleStop = RenderScale.presetIndex(s.renderScale)
+        val showCustomScale = customScalePicked || scaleStop == null
+        SettingDropdown(
+            label = stringResource(R.string.player_render_scale),
+            options = RenderScale.PRESETS.map { it to renderScaleLabel(it) } + (CUSTOM_RENDER_SCALE to
+                if (scaleStop == null) {
+                    stringResource(R.string.player_render_scale_custom_value, "${RenderScale.percent(s.renderScale)} %")
+                } else {
+                    stringResource(R.string.player_render_scale_custom)
+                }),
+            selected = if (showCustomScale) CUSTOM_RENDER_SCALE else RenderScale.PRESETS[scaleStop],
+            field = "render_scale",
+            caption = stringResource(R.string.player_render_scale_hint),
+        ) { scale ->
+            customScalePicked = scale == CUSTOM_RENDER_SCALE
+            if (scale != CUSTOM_RENDER_SCALE) update("render_scale", s.copy(renderScale = scale))
+        }
+        if (showCustomScale) {
+            RenderScaleField(s.renderScale) { scale -> update("render_scale", s.copy(renderScale = scale)) }
+        }
+
+        // Asks nothing of the panel, so no capability gate: an 8-bit display shows a dithered
+        // Main10 stream, and the gain is gradients that do not band. Inert while HDR is on
+        // above — that already carries 10 bits — so the row dims rather than disappearing.
+        ToggleRow(
+            title = stringResource(R.string.player_ten_bit_sdr),
+            subtitle = stringResource(
+                if (hdrOn) R.string.android_ten_bit_sdr_hdr_hint else R.string.player_ten_bit_sdr_hint,
+            ),
+            checked = s.tenBitSdr && !hdrOn,
+            enabled = !hdrOn,
+            field = "ten_bit_sdr",
+            onCheckedChange = { on -> update("ten_bit_sdr", s.copy(tenBitSdr = on)) },
+        )
+        // Android has no decoder or GPU picker (MediaCodec resolves both); this one knob is worth
+        // varying per host, since a marginal link is where the plain decode path helps.
+        ToggleRow(
+            title = stringResource(R.string.player_low_latency),
+            subtitle = stringResource(R.string.player_low_latency_hint),
+            checked = s.lowLatencyMode,
+            field = "low_latency_mode",
+            onCheckedChange = { on -> update("low_latency_mode", s.copy(lowLatencyMode = on)) },
+        )
+        // This device's screen, so never a preset's.
+        DeviceScopeOnly {
+            ToggleRow(
+                title = stringResource(R.string.player_keep_awake),
+                subtitle = stringResource(R.string.player_keep_awake_hint),
+                checked = s.keepAwake,
+                onCheckedChange = { on -> update("keep_awake", s.copy(keepAwake = on)) },
+            )
+        }
+        SettingDropdown(
+            label = stringResource(R.string.player_compositor),
+            options = COMPOSITOR_OPTIONS.named(),
+            selected = s.compositor,
+            field = "compositor",
+            caption = stringResource(R.string.player_compositor_hint),
+        ) { c -> update("compositor", s.copy(compositor = c)) }
+    }
+    if (hdrWarning) {
+        PunktfunkDialog(
+            title = stringResource(R.string.player_hdr_enabled_no_headroom_title),
+            onDismiss = { hdrWarning = false },
+            actions = listOf(
+                DialogAction(stringResource(R.string.player_hdr_enabled_no_headroom_confirm)) {
+                    hdrWarning = false
+                    onHdrWithoutHeadroom()
+                },
+                DialogAction(stringResource(R.string.common_cancel)) { hdrWarning = false },
+            ),
+        ) { PromptText(stringResource(R.string.player_hdr_enabled_no_headroom_body)) }
+    }
+}
+
+/**
+ * A preset's Host screen: as on the host card, a role, or a monitor of a host this device knows,
+ * from each paired host's answer, asked when the row shows. Preset scope only: a host's default
+ * is the pick on its card.
+ */
+@Composable
+private fun HostScreenGroup(s: Settings, update: (String, Settings) -> Unit) {
+    if (!LocalSettingsScope.current.presetScope) return
+    val context = LocalContext.current
+    var known by remember { mutableStateOf<List<Pair<String, DisplayTargets.Targets>>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        val hosts = KnownHostStore(context).all().filter { it.paired && it.fpHex.isNotEmpty() }
+        if (hosts.isEmpty()) return@LaunchedEffect
+        known = withContext(Dispatchers.IO) {
+            val id = IdentityHolder.shared(context).await() ?: return@withContext emptyList()
+            hosts.map { kh ->
+                async {
+                    DisplayTargets.fetch(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
+                        ?.let { kh.name.ifBlank { kh.address } to it }
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }
+    val choices = DisplayTargets.hostScreenChoices(known, s.hostScreen, context.resources)
+    val picked = choices.firstOrNull { it.checked }
+    SettingsGroup {
+        SettingDropdown(
+            label = stringResource(R.string.preset_host_screen),
+            options = choices.map { it.value.orEmpty() to it.label },
+            selected = picked?.value.orEmpty(),
+            field = "host_screen",
+            caption = picked?.hint,
+            headers = choices.mapNotNull { c -> c.header?.let { c.value.orEmpty() to it } }.toMap(),
+        ) { v -> update("host_screen", s.copy(hostScreen = v)) }
+    }
+}
+
+@Composable
+private fun InputSettings(
+    s: Settings,
+    update: (String, Settings) -> Unit,
+    onOpenQuickActions: () -> Unit,
+    onOpenShortcuts: () -> Unit,
+) {
+    val back = stringResource(R.string.common_back)
+    val ringKeys = s.shortcutHint(Shortcuts.Action.Ring, Shortcuts.Device.KEYBOARD)
+    val ringPad = s.shortcutHint(Shortcuts.Action.Ring, Shortcuts.Device.PAD)
+    SettingsGroup(stringResource(R.string.prefs_group_touch_pointer)) {
+        SettingDropdown(
+            label = stringResource(R.string.player_touch_mode),
+            options = TOUCH_MODE_OPTIONS.worded(),
+            selected = s.touchMode,
+            field = "touch_mode",
+            caption = stringResource(R.string.player_touch_mode_hint),
+        ) { mode -> update("touch_mode", s.copy(touchMode = mode)) }
+        Column {
+            OverrideBadge("overlay_actions")
+            ClickableRow(
+                title = stringResource(R.string.player_overlay_actions),
+                subtitle = listOfNotNull(
+                    if (ringKeys != null && ringPad != null) {
+                        stringResource(R.string.android_player_overlay_actions_opener, back, ringKeys, ringPad)
+                    } else {
+                        null
+                    },
+                    stringResource(R.string.player_overlay_actions_hint),
+                ).joinToString(" "),
+                onClick = onOpenQuickActions,
+            )
+        }
+        Column {
+            OverrideBadge("shortcuts")
+            ClickableRow(
+                title = stringResource(R.string.player_shortcuts),
+                subtitle = stringResource(R.string.player_shortcuts_hint),
+                onClick = onOpenShortcuts,
+            )
+        }
+        // A device setting: a preset carries no value for it.
+        DeviceScopeOnly {
+            ToggleRow(
+                title = stringResource(R.string.android_player_back_opens_ring),
+                subtitle = stringResource(R.string.android_player_back_opens_ring_hint, back),
+                checked = s.backOpensRing,
+                onCheckedChange = { on -> update("android.back_opens_ring", s.copy(backOpensRing = on)) },
+            )
+        }
+    }
+    SettingsGroup(stringResource(R.string.prefs_group_keyboard_mouse)) {
+        SettingDropdown(
+            label = stringResource(R.string.player_mouse_mode),
+            options = MOUSE_MODE_OPTIONS.worded(),
+            selected = s.mouseMode,
+            field = "mouse_mode",
+            caption = stringResource(R.string.player_mouse_mode_hint) +
+                s.shortcutHint(Shortcuts.Action.Slot(SlotId.ReleaseInput), Shortcuts.Device.KEYBOARD)
+                    ?.let { " " + stringResource(R.string.player_mouse_mode_keys_hint, it) }.orEmpty(),
+        ) { mode -> update("mouse_mode", s.copy(mouseMode = mode)) }
+        ToggleRow(
+            title = stringResource(R.string.player_invert_scroll),
+            subtitle = stringResource(R.string.player_invert_scroll_hint),
+            checked = s.invertScroll,
+            field = "invert_scroll",
+            onCheckedChange = { on -> update("invert_scroll", s.copy(invertScroll = on)) },
+        )
+        // Alt+Tab, the Meta chords and the Language key never reach an app; the key service
+        // filters them ahead of Android. It is enabled under Accessibility, which we can only
+        // open, and only after [KeyCaptureDisclosure].
+        val context = LocalContext.current
+        var disclose by remember { mutableStateOf(false) }
+        val keysOn = KeyCaptureService.running
+        ClickableRow(
+            title = stringResource(
+                if (keysOn) R.string.android_keyboard_shortcuts_on else R.string.android_keyboard_shortcuts,
+            ),
+            subtitle = stringResource(
+                if (keysOn) R.string.android_keyboard_shortcuts_on_hint else R.string.android_keyboard_shortcuts_hint,
+            ),
+            onClick = { if (KeyCaptureService.running) openAccessibilitySettings(context) else disclose = true },
+        )
+        if (disclose) KeyCaptureDisclosure(onDismiss = { disclose = false })
+        // "Shared clipboard" is NOT here: it is a trust decision about one host, so it lives on the
+        // host record and is edited from that host's Edit sheet.
+    }
+}
+
+@Composable
+private fun AudioSettings(s: Settings, update: (String, Settings) -> Unit, onMicChange: (Boolean) -> Unit) {
+    SettingsGroup(footer = stringResource(R.string.prefs_applies_next_session)) {
+        SettingDropdown(
+            label = stringResource(R.string.player_audio_channels),
+            options = AUDIO_CHANNEL_OPTIONS.worded(),
+            selected = s.audioChannels,
+            field = "audio_channels",
+            caption = stringResource(R.string.player_audio_channels_hint),
+        ) { ch -> update("audio_channels", s.copy(audioChannels = ch)) }
+        ToggleRow(
+            title = stringResource(R.string.player_mic_enabled),
+            subtitle = stringResource(R.string.player_mic_enabled_hint),
+            checked = s.micEnabled,
+            field = "mic_enabled",
+            onCheckedChange = onMicChange,
+        )
+    }
+    val d = Settings()
+    AdvancedGroup(
+        changed = changedCount(
+            s.audioFormat != d.audioFormat,
+            s.keepHostAudio != d.keepHostAudio,
+            s.echoCancel != d.echoCancel,
+        ),
+        fields = setOf("audio_format", "keep_host_audio", "echo_cancel"),
+    ) {
+        // Offered at every channel count: surround negotiates a shorter frame, and only the top of
+        // this list fits nothing. The HUD's `audio lossless …` line reports what a session got.
+        SettingDropdown(
+            label = stringResource(R.string.player_audio_format),
+            options = AUDIO_FORMAT_OPTIONS.worded(),
+            selected = s.audioFormat,
+            field = "audio_format",
+            caption = stringResource(R.string.player_audio_format_hint),
+        ) { f -> update("audio_format", s.copy(audioFormat = f)) }
+        ToggleRow(
+            title = stringResource(R.string.player_keep_host_audio),
+            subtitle = stringResource(R.string.player_keep_host_audio_hint),
+            checked = s.keepHostAudio,
+            field = "keep_host_audio",
+            onCheckedChange = { on -> update("keep_host_audio", s.copy(keepHostAudio = on)) },
+        )
+        ToggleRow(
+            title = stringResource(R.string.player_echo_cancel),
+            subtitle = stringResource(R.string.player_echo_cancel_hint),
+            checked = s.echoCancel,
+            enabled = s.micEnabled,
+            field = "echo_cancel",
+            onCheckedChange = { on -> update("echo_cancel", s.copy(echoCancel = on)) },
+        )
+    }
+}
+
+@Composable
+private fun ControllerSettings(s: Settings, update: (String, Settings) -> Unit, onOpenControllers: () -> Unit) {
+    SettingsGroup(footer = stringResource(R.string.prefs_applies_next_session)) {
+        SettingDropdown(
+            label = stringResource(R.string.player_gamepad),
+            options = GAMEPAD_OPTIONS.named(),
+            selected = s.gamepad,
+            field = "gamepad",
+            enabled = s.gamepadForwarding,
+            caption = stringResource(R.string.player_gamepad_hint),
+        ) { g -> update("gamepad", s.copy(gamepad = g)) }
+        DeviceScopeOnly {
+            ToggleRow(
+                title = stringResource(R.string.player_pad_rumble),
+                subtitle = stringResource(R.string.player_pad_rumble_hint),
+                checked = s.padRumble,
+                enabled = s.gamepadForwarding,
+                onCheckedChange = { on -> update("pad_rumble", s.copy(padRumble = on)) },
+            )
+            ClickableRow(
+                title = stringResource(R.string.android_prefs_controllers),
+                subtitle = stringResource(R.string.android_prefs_controllers_hint),
+                onClick = onOpenControllers,
+            )
+            // Both rows below are about this device's own body, so the form factor gates them
+            // before the hardware does: a Shield reports the attached pad's vibrator and
+            // gyroscope as its own (#449). `deviceBodyVibrator` stays ungated for its other callers.
+            val context = LocalContext.current
+            val tv = remember { isTvDevice(context) }
+            val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
+            if (!tv && hasBodyVibrator) {
+                ToggleRow(
+                    title = stringResource(R.string.player_rumble_on_phone),
+                    subtitle = stringResource(R.string.player_rumble_on_phone_hint),
+                    checked = s.rumbleOnPhone,
+                    onCheckedChange = { on -> update("android.rumble_on_phone", s.copy(rumbleOnPhone = on)) },
+                )
+            }
+            // The rumble mirror's sibling, data flowing the other way: needs a gyroscope to
+            // mirror FROM, and a body to tilt.
+            val hasGyroscope = remember { DeviceGyro.available(context) }
+            if (!tv && hasGyroscope) {
+                ToggleRow(
+                    title = stringResource(R.string.player_gyro_on_phone),
+                    subtitle = stringResource(R.string.player_gyro_on_phone_hint),
+                    checked = s.gyroOnPhone,
+                    onCheckedChange = { on -> update("android.gyro_on_phone", s.copy(gyroOnPhone = on)) },
+                )
+            }
+        }
+    }
+    val d = Settings()
+    AdvancedGroup(
+        changed = changedCount(
+            s.gamepadForwarding != d.gamepadForwarding,
+            s.systemButtons != d.systemButtons,
+            s.dsCapture != d.dsCapture,
+            s.padHaptics != d.padHaptics,
+            s.padSpeaker != d.padSpeaker,
+        ),
+        fields = setOf("gamepad_forwarding", "system_buttons"),
+    ) {
+        // The master switch, above everything it governs. Presetable, so it shows in both
+        // scopes: a "Work" preset can decline to forward what "Game" forwards.
+        ToggleRow(
+            title = stringResource(R.string.player_gamepad_forwarding),
+            subtitle = stringResource(R.string.player_gamepad_forwarding_hint),
+            checked = s.gamepadForwarding,
+            field = "gamepad_forwarding",
+            onCheckedChange = { on -> update("gamepad_forwarding", s.copy(gamepadForwarding = on)) },
+        )
+        SettingDropdown(
+            label = stringResource(R.string.player_system_buttons),
+            options = SYSTEM_BUTTON_OPTIONS.worded(),
+            selected = s.systemButtons,
+            field = "system_buttons",
+            enabled = s.gamepadForwarding,
+            caption = stringResource(R.string.player_system_buttons_hint),
+        ) { v -> update("system_buttons", s.copy(systemButtons = v)) }
+        DeviceScopeOnly {
+            // Feedback lands on the CONTROLLER's own motors and LEDs, so no vibrator gate.
+            ToggleRow(
+                title = stringResource(R.string.player_ds_capture),
+                subtitle = stringResource(R.string.player_ds_capture_hint),
+                checked = s.dsCapture,
+                enabled = s.gamepadForwarding,
+                onCheckedChange = { on -> update("android.ds_capture", s.copy(dsCapture = on)) },
+            )
+            // Both only ever apply to a captured pad, so they follow that row and gate on it.
+            ToggleRow(
+                title = stringResource(R.string.player_pad_haptics),
+                subtitle = stringResource(R.string.player_pad_haptics_hint),
+                checked = s.padHaptics,
+                enabled = s.gamepadForwarding && s.dsCapture,
+                onCheckedChange = { on -> update("pad_haptics", s.copy(padHaptics = on)) },
+            )
+            // Off by default (see Settings.padSpeaker), and a silent pad speaker looks exactly like
+            // broken hardware, so the subtitle says the default out loud.
+            ToggleRow(
+                title = stringResource(R.string.player_pad_speaker),
+                subtitle = stringResource(R.string.player_pad_speaker_hint),
+                checked = s.padSpeaker,
+                enabled = s.gamepadForwarding && s.dsCapture,
+                onCheckedChange = { on -> update("pad_speaker", s.copy(padSpeaker = on)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun AboutSettings(
+    context: android.content.Context,
+    onOpenLicenses: () -> Unit,
+) {
+    // The app's own version, read from the installed package (the WinUI/Apple About convention:
+    // identity first, then the legal rows). Empty on a harness with no real package info.
+    val version = remember {
+        runCatching {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty()
+    }
+    SettingsGroup {
+        Column {
+            Text("Punktfunk", style = MaterialTheme.typography.titleLarge)
+            if (version.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.about_version_line, version),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        ClickableRow(
+            title = stringResource(R.string.about_licenses),
+            subtitle = stringResource(R.string.about_licenses_hint),
+            onClick = onOpenLicenses,
+        )
+    }
+}
+
+// ---- Row / group primitives --------------------------------------------------------------------
+
+/**
+ * A group of settings rendered inside an outlined card, with an optional sub-section [header]
+ * above it and an optional form-level [footer] beneath it. The header is what turns a long
+ * category into the scannable sub-sections the desktop clients have ("Resolution", "Quality",
+ * "Host output"); the footer carries the one "applies from the next session" note per category —
+ * per-field guidance lives on the fields themselves.
+ */
+@Composable
+internal fun SettingsGroup(
+    header: String? = null,
+    footer: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (header != null) {
+            Text(
+                header,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                letterSpacing = 0.sp,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+        OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                content = content,
+            )
+        }
+        if (footer != null) {
+            Text(
+                footer,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+    }
+}
+
+/**
+ * A title + subtitle on the left, a Switch on the right. [enabled] greys out the whole row;
+ * [field] is the overlay field this row writes, which is what its override marker keys on.
+ */
+@Composable
+internal fun ToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+    field: String? = null,
+) {
+    // Dim the labels when disabled so the row reads as inactive (the Switch dims itself).
+    val labelAlpha = if (enabled) 1f else 0.38f
+    Column {
+        OverrideBadge(field)
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = labelAlpha),
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = labelAlpha),
+                )
+            }
+            Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+        }
+    }
+}
+
+/**
+ * PyroWave quality in Bitrate's place: 0.5 to 2 by tenths, never shown as bits per pixel. The
+ * caption is the rate it needs at the picture the host encodes; the warning follows while this
+ * device's link is short of it.
+ */
+@Composable
+private fun PyroWaveQualityRow(s: Settings, update: (String, Settings) -> Unit) {
+    val context = LocalContext.current
+    val link = remember { PyroWaveQuality.link(context) }
+    val cost = PyroWaveQuality.lines(s, s.effectiveMode(context), link)
+    val caption = stringResource(R.string.player_pyrowave_bpp_rate, cost.width, cost.height, cost.hz, cost.rate)
+    val warning = cost.warning
+    val at = PyroWaveQuality.snapped(s.pyrowaveBpp)
+    Column {
+        OverrideBadge("pyrowave_bpp")
+        Text(stringResource(R.string.player_pyrowave_bpp), style = MaterialTheme.typography.bodyLarge)
+        Slider(
+            value = at.toFloat(),
+            onValueChange = { v ->
+                val bpp = PyroWaveQuality.snapped(v.toDouble())
+                if (bpp != at) update("pyrowave_bpp", s.copy(pyrowaveBpp = bpp))
+            },
+            valueRange = PyroWaveQuality.RANGE,
+            steps = PyroWaveQuality.STEPS,
+        )
+        Text(
+            caption,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (warning != null) {
+            Text(
+                warning,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+/** A title + subtitle on the left; the whole row is clickable (opens a sub-screen). */
+@Composable
+private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Icon(
+            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp),
+        )
+    }
+}
+
+/**
+ * A labelled read-only dropdown over [options] (value → label); calls [onSelect] on a pick.
+ * [caption] is the field's own explanation, rendered directly under the control — the `described()`
+ * idiom the other clients use, so a dropdown's guidance belongs to it instead of floating as a
+ * loose paragraph between rows. [field] is the overlay field this row writes, which is what its
+ * override marker keys on. [headers] start a group in the menu at the option of that value.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun <T> SettingDropdown(
+    label: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    field: String? = null,
+    caption: String? = null,
+    enabled: Boolean = true,
+    headers: Map<T, String> = emptyMap(),
+    onSelect: (T) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = options.firstOrNull { it.first == selected }?.second
+        ?: options.firstOrNull()?.second.orEmpty()
+    Column {
+        OverrideBadge(field)
+        ExposedDropdownMenuBox(
+            expanded = expanded && enabled,
+            onExpandedChange = { if (enabled) expanded = it },
+        ) {
+            OutlinedTextField(
+                value = selectedLabel,
+                onValueChange = {},
+                readOnly = true,
+                enabled = enabled,
+                label = { Text(label) },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                    .fillMaxWidth(),
+            )
+            ExposedDropdownMenu(
+                expanded = expanded && enabled,
+                onDismissRequest = { expanded = false },
+            ) {
+                options.forEach { (value, lbl) ->
+                    headers[value]?.let { header ->
+                        HorizontalDivider()
+                        Text(
+                            header,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 2.dp),
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text(lbl) },
+                        onClick = {
+                            onSelect(value)
+                            expanded = false
+                        },
+                    )
+                }
+            }
+        }
+        if (caption != null) {
+            Text(
+                caption,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 10.dp),
+            )
+        }
+    }
+}
+
+/** One side of a custom resolution. Digits only; every non-zero keystroke commits the raw number,
+ * which the caller passes through [Resolutions.custom]. The field keeps the raw text so
+ * intermediate states ("15" on the way to "1512") aren't rewritten mid-typing; it snaps to the
+ * committed value when focus leaves. */
+@Composable
+private fun ResolutionField(
+    label: String,
+    value: Int,
+    modifier: Modifier = Modifier,
+    onCommit: (Int) -> Unit,
+) {
+    var text by remember { mutableStateOf(if (value > 0) value.toString() else "") }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = asciiDigits(raw).take(4)
+            val v = text.toIntOrNull() ?: 0
+            if (v > 0) onCommit(v)
+        },
+        label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = modifier.onFocusChanged { if (!it.isFocused) text = if (value > 0) value.toString() else "" },
+    )
+}
+
+/** A fixed bitrate in whole Mbps. Digits only; each keystroke commits, capped at
+ * [CUSTOM_BITRATE_MAX_MBPS]. Empty or `0` commits nothing — Automatic is the menu's first entry. */
+@Composable
+private fun BitrateField(kbps: Int, onCommit: (Int) -> Unit) {
+    val shown = if (kbps > 0) ((kbps + 500) / 1000).toString() else ""
+    var text by remember { mutableStateOf(shown) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = asciiDigits(raw).take(4)
+            val mbps = (text.toIntOrNull() ?: 0).coerceAtMost(CUSTOM_BITRATE_MAX_MBPS)
+            if (mbps > 0) onCommit(mbps * 1000)
+        },
+        label = { Text(stringResource(R.string.player_bitrate_kbps_entry)) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) text = shown },
+    )
+}
+
+/** A render scale as a whole percent. Digits only; the scale is stored when the field loses
+ * focus or the keyboard's Done is pressed, so a half-typed "1" is never clamped to 50 under the
+ * thumb. Empty or `0` stores nothing. */
+@Composable
+private fun RenderScaleField(scale: Double, onCommit: (Double) -> Unit) {
+    val shown = RenderScale.percent(scale).toString()
+    var text by remember(shown) { mutableStateOf(shown) }
+    val commit = {
+        val percent = text.toIntOrNull() ?: 0
+        if (percent > 0) onCommit(RenderScale.fromPercent(percent)) else text = shown
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw -> text = asciiDigits(raw).take(3) },
+        label = { Text(stringResource(R.string.player_render_scale_entry)) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commit() }),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) commit() },
+    )
+}
+
+/**
+ * Names the host the Start in row resolves to, and says when it resolves to nothing — which is
+ * what every value does until one host is paired. The pointer is written from a host's own card
+ * menu, not from this screen, so the caption is where the two meet.
+ */
+@Composable
+private fun startInCaption(s: Settings, context: android.content.Context): String {
+    val hosts = KnownHostStore(context).all()
+    val host = StartScreen.defaultHost(s.defaultHost, hosts).host
+        ?: return stringResource(R.string.player_start_in_no_host_hint)
+    return stringResource(R.string.player_start_in_host_hint, host.name)
+}
+
+/** A message-id option table in the player's language, for [SettingDropdown]. */
+@Composable
+internal fun <T> List<Pair<T, Int>>.worded(): List<Pair<T, String>> =
+    map { (value, id) -> value to stringResource(id) }
+
+/** An [OptionLabel] option table in the player's language, for [SettingDropdown]. */
+@Composable
+internal fun <T> List<Pair<T, OptionLabel>>.named(): List<Pair<T, String>> = map { (value, label) ->
+    value to when (label) {
+        is OptionLabel.Message -> stringResource(label.id)
+        is OptionLabel.Name -> label.text
+    }
+}
+
+/** The picker label of a render scale: Native, a supersample, or the bare multiplier of a lighter one. */
+@Composable
+private fun renderScaleLabel(scale: Double): String = when {
+    scale == 1.0 -> stringResource(R.string.player_render_scale_native)
+    scale > 1.0 -> stringResource(R.string.player_render_scale_supersample, RenderScale.digits(scale))
+    else -> "${RenderScale.digits(scale)}×"
+}
+
+/** The first trigger [s] binds to [action] on [device], worded: a caption names the live chord. */
+@Composable
+private fun Settings.shortcutHint(action: Shortcuts.Action, device: Shortcuts.Device): String? {
+    return shortcutBindings().hint(action, device)?.words(LocalContext.current.resources)
+}

@@ -1,0 +1,79 @@
+package io.unom.punktfunk
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import io.unom.punktfunk.kit.NativeBridge
+import kotlin.math.roundToInt
+
+/** [Settings.pyrowaveBpp] in the hundredths the dial carries, held inside 0.5…2. */
+fun Settings.pyrowaveBppX100(): Int = (pyrowaveBpp.coerceIn(0.5, 2.0) * 100).roundToInt()
+
+/** PyroWave quality as its row reads it. Core prices the rate and words the warning. */
+object PyroWaveQuality {
+    /** Core's `BPP_FLOOR` to `BPP_MAX`; the slider stops at every tenth between them. */
+    val RANGE = 0.5f..2.0f
+    const val STEPS = 14
+
+    /** `PUNKTFUNK_IFACE_KIND_*`. */
+    private const val KIND_UNKNOWN = 0
+    private const val KIND_ETHERNET = 1
+    private const val KIND_WIFI = 2
+    private const val KIND_OTHER = 3
+
+    /** Bitrate under PyroWave offers Automatic or Fixed; Fixed stores this. The host pins the
+     *  session at the quality, so only "not zero" counts. Core's `PYROWAVE_FIXED_KBPS`. */
+    const val FIXED_KBPS = 20_000
+
+    /** [bpp] on the nearest tenth inside [RANGE]. */
+    fun snapped(bpp: Double): Double = (bpp.coerceIn(0.5, 2.0) * 10).roundToInt() / 10.0
+
+    /** This device's link as `kind to mbps`: core's, with Android's transport filling a gap. */
+    fun link(context: Context): Pair<Int, Int> {
+        val own = NativeBridge.nativeLocalLink()
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+        return filledIn(
+            (own?.getOrNull(0) ?: KIND_UNKNOWN) to (own?.getOrNull(1) ?: 0),
+            wifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true,
+            ethernet = caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true,
+        )
+    }
+
+    /** [own] unless core named no kind, which an app barred from `/sys` reads as other: then
+     *  Android's transport, speed unknown. */
+    fun filledIn(own: Pair<Int, Int>, wifi: Boolean, ethernet: Boolean): Pair<Int, Int> = when {
+        own.first != KIND_UNKNOWN && own.first != KIND_OTHER -> own
+        wifi -> KIND_WIFI to 0
+        ethernet -> KIND_ETHERNET to 0
+        else -> own
+    }
+
+    /**
+     * What the quality costs at a picture: its size and rate, core's [rate] text (`1.6 Gbit/s`),
+     * and the [warning] when the link is short of it. The row words them with
+     * `player_pyrowave_bpp_rate`.
+     */
+    data class Cost(val width: Int, val height: Int, val hz: Int, val rate: String, val warning: String?)
+
+    /**
+     * The [Cost] of the picture a connect would have the host encode: the view [Settings.streamAsk]
+     * names, else its mode. [base] is [effectiveMode]'s answer. [price] is
+     * [NativeBridge.nativePyrowaveQuality].
+     */
+    fun lines(
+        s: Settings,
+        base: Triple<Int, Int, Int>,
+        link: Pair<Int, Int>,
+        price: (Int, Int, Int, Boolean, Int, Int, Int, Int) -> String = NativeBridge::nativePyrowaveQuality,
+    ): Cost {
+        val (mode, view) = s.streamAsk(base, null) { base }
+        val (w, h) = view ?: (mode.first to mode.second)
+        val hz = mode.third
+        // No 4:4:4 on Android; 10 bits follow the switches that ask for them.
+        val depth = if (s.hdrEnabled || s.tenBitSdr) 10 else 8
+        val out = price(w, h, hz, false, depth, s.pyrowaveBppX100(), link.first, link.second)
+        val warning = out.substringAfter('\n', "")
+        return Cost(w, h, hz, out.substringBefore('\n'), warning.ifEmpty { null })
+    }
+}

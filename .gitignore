@@ -1,0 +1,19 @@
+/target
+/target-linux
+/.toolchains
+/dist
+*.nro
+*.elf
+*.nacp
+.env
+.DS_Store
+
+# Local Switch 2 builds and caches (never commit these).
+/.pf2-cache/
+/.pf2-work/
+/.pf2-unified-ready
+/dist/
+/target/
+/switch2/work/
+/switch2/tests/__pycache__/
+/switch2/tooling/__pycache__/

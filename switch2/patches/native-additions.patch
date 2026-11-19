@@ -1,0 +1,1106 @@
+diff --git a/ports/switch2/native/pf2_audio_switch2.c b/ports/switch2/native/pf2_audio_switch2.c
+new file mode 100644
+index 0000000..ce869d9
+--- /dev/null
++++ b/ports/switch2/native/pf2_audio_switch2.c
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++#include "pf2_native.h"
++#if !defined(__SWITCH2__)
++#error "Native Switch 2 audio only"
++#endif
++#include <switch.h>
++#include <malloc.h>
++#include <math.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++
++struct Pf2Audio { uint32_t rate, channels; int started; };
++
++Pf2Error pf2_audio_open(Pf2Audio **out, uint32_t rate, uint32_t channels) {
++    if (!out) return PF2_INVALID;
++    *out = NULL;
++    if (rate != 48000 || channels != 2) return PF2_UNSUPPORTED;
++    Pf2Audio *a = calloc(1, sizeof(*a));
++    if (!a) return PF2_NO_MEMORY;
++    Result rc = audoutInitialize();
++    if (R_FAILED(rc)) { free(a); return PF2_SDK_ERROR; }
++    if (audoutGetSampleRate() != 48000 || audoutGetChannelCount() != 2) {
++        audoutExit(); free(a); return PF2_UNSUPPORTED;
++    }
++    rc = audoutStartAudioOut();
++    if (R_FAILED(rc)) { audoutExit(); free(a); return PF2_SDK_ERROR; }
++    a->rate = rate;
++    a->channels = channels;
++    a->started = 1;
++    *out = a;
++    return PF2_OK;
++}
++
++Pf2Error pf2_audio_write(Pf2Audio *a, const float *pcm, size_t frames) {
++    if (!a || !a->started || !pcm || !frames || frames > 48000) return PF2_INVALID;
++    if (frames > SIZE_MAX / (2 * sizeof(int16_t))) return PF2_INVALID;
++    size_t bytes = frames * 2 * sizeof(int16_t);
++    const size_t aligned = (bytes + 4095) & ~(size_t)4095;
++    int16_t *buf = memalign(4096, aligned);
++    if (!buf) return PF2_NO_MEMORY;
++    for (size_t i=0; i<frames*2; ++i) {
++        float f = pcm[i];
++        if (!isfinite(f)) f = 0;
++        f = fmaxf(-1.f, fminf(1.f, f));
++        buf[i] = (int16_t)lrintf(f * 32767.f);
++    }
++    AudioOutBuffer packet = {0};
++    packet.buffer = buf;
++    packet.buffer_size = aligned;
++    packet.data_size = bytes;
++    AudioOutBuffer *released = NULL;
++    Result rc = audoutPlayBuffer(&packet, &released);
++    // audoutPlayBuffer waits for release. No buffer is freed while queued.
++    if (R_SUCCEEDED(rc) && released != &packet) rc = MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen);
++    free(buf);
++    return R_SUCCEEDED(rc) ? PF2_OK : PF2_SDK_ERROR;
++}
++
++void pf2_audio_close(Pf2Audio *a) {
++    if (!a) return;
++    if (a->started) {
++        bool flushed = false;
++        audoutFlushAudioOutBuffers(&flushed);
++        audoutStopAudioOut();
++        audoutExit();
++    }
++    free(a);
++}
+diff --git a/ports/switch2/native/pf2_decoder_switch2.c b/ports/switch2/native/pf2_decoder_switch2.c
+new file mode 100644
+index 0000000..98e359d
+--- /dev/null
++++ b/ports/switch2/native/pf2_decoder_switch2.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Native libounce decoder using the actual Switch 2 VideoDecoder API.
++// No libnx Switch 1 NVDEC calls and no third-party streaming protocol.
++#include "pf2_native.h"
++#if !defined(__SWITCH2__)
++#error "This translation unit must only be built by the Switch 2 toolchain"
++#endif
++#include <switch.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++struct Pf2Decoder {
++    VideoDecoder object;
++    VideoFrame frame;
++    uint8_t *y;
++    uint8_t *uv;
++    size_t luma_bytes;
++    size_t chroma_bytes;
++    uint32_t width;
++    uint32_t height;
++    uint32_t last_sdk_result;
++    bool opened;
++    bool held;
++};
++
++static Pf2Error sdk_error(Pf2Decoder *d, Result rc) {
++    d->last_sdk_result = (uint32_t)rc;
++    if (R_VALUE(rc) == KERNELRESULT(TimedOut)) return PF2_NOT_READY;
++    return PF2_SDK_ERROR;
++}
++
++Pf2Error pf2_decoder_open(Pf2Decoder **out, const Pf2DecoderSettings *settings) {
++    if (!out || !settings) return PF2_INVALID;
++    *out = NULL;
++    if (settings->codec != ViddecCodec_Av1 && settings->codec != ViddecCodec_H264)
++        return PF2_UNSUPPORTED;
++    if (!settings->width || !settings->height || (settings->width & 1) || (settings->height & 1) ||
++        settings->width > 8192 || settings->height > 8192 ||
++        settings->fps > VIDEO_DECODER_MAX_FRAME_RATE ||
++        (settings->image_count && (settings->image_count < 2 || settings->image_count > VIDDEC_MAX_IMAGES)) ||
++        (settings->codec == ViddecCodec_H264 && (!settings->codec_data || !settings->codec_data_length)) ||
++        (settings->codec_data_length && !settings->codec_data)) return PF2_INVALID;
++    const size_t pixels = (size_t)settings->width * settings->height;
++    if (pixels > SIZE_MAX / 4) return PF2_INVALID;
++    Pf2Decoder *d = calloc(1, sizeof(*d));
++    if (!d) return PF2_NO_MEMORY;
++    d->width = settings->width;
++    d->height = settings->height;
++    d->luma_bytes = pixels;
++    d->chroma_bytes = pixels / 2;
++    d->y = malloc(d->luma_bytes);
++    d->uv = malloc(d->chroma_bytes);
++    if (!d->y || !d->uv) {
++        pf2_decoder_close(d);
++        return PF2_NO_MEMORY;
++    }
++    VideoDecoderConfig config = {
++        .codec = (ViddecCodec)settings->codec,
++        .width = settings->width,
++        .height = settings->height,
++        .image_count = settings->image_count ? settings->image_count : VIDEO_DECODER_DEFAULT_IMAGES,
++        .frame_rate = settings->fps,
++        .tiling = settings->codec == ViddecCodec_Av1 ? ViddecTilingMode_BlockLinear : ViddecTilingMode_PitchLinear,
++        .max_sample_size = settings->max_sample_bytes,
++        .codec_config = settings->codec_data,
++        .codec_config_size = settings->codec_data_length,
++    };
++    Result rc = videoDecoderCreate(&d->object, &config);
++    if (R_FAILED(rc)) {
++        // A failed Create is not necessarily a fully initialized decoder; the SDK owns rollback.
++        d->last_sdk_result = (uint32_t)rc;
++        pf2_decoder_close(d);
++        return PF2_SDK_ERROR;
++    }
++    d->opened = true;
++    *out = d;
++    return PF2_OK;
++}
++
++Pf2Error pf2_decoder_submit(Pf2Decoder *d, const uint8_t *data,
++                            size_t length, int64_t pts_ns, uint64_t timeout_ns) {
++    if (!d || !d->opened || !data || !length) return PF2_INVALID;
++    if (d->held) return PF2_NOT_READY;
++    Result rc = videoDecoderSubmit(&d->object, data, length, pts_ns, false, timeout_ns);
++    if (R_FAILED(rc)) return sdk_error(d, rc);
++    return PF2_OK;
++}
++
++Pf2Error pf2_decoder_acquire(Pf2Decoder *d, Pf2DecodedFrame *out,
++                             uint64_t timeout_ns) {
++    if (!d || !out || !d->opened) return PF2_INVALID;
++    if (d->held) return PF2_NOT_READY;
++    Result rc = videoDecoderGetFrame(&d->object, &d->frame, timeout_ns);
++    if (R_FAILED(rc)) return sdk_error(d, rc);
++    // Real producer dependency has been waited for by videoDecoderGetFrame.
++    const uint32_t w = d->frame.width, h = d->frame.height;
++    if (!w || !h || (w & 1) || (h & 1) || w > d->width || h > d->height) {
++        videoDecoderReleaseFrame(&d->object, &d->frame);
++        return PF2_UNSUPPORTED;
++    }
++    d->held = true;
++    rc = videoDecoderCopyFrame(&d->object, &d->frame, d->y, d->width, d->uv, d->width);
++    if (R_FAILED(rc)) {
++        videoDecoderReleaseFrame(&d->object, &d->frame);
++        d->held = false;
++        return sdk_error(d, rc);
++    }
++    *out = (Pf2DecodedFrame) {
++        .width = w,
++        .height = h,
++        .pitch_y = d->width,
++        .pitch_uv = d->width,
++        .pts_ns = d->frame.timestamp_ns >= 0 ? (uint64_t)d->frame.timestamp_ns : 0,
++        .plane_y = d->y,
++        .plane_uv = d->uv,
++    };
++    return PF2_OK;
++}
++
++Pf2Error pf2_decoder_release(Pf2Decoder *d) {
++    if (!d || !d->opened || !d->held) return PF2_INVALID;
++    videoDecoderReleaseFrame(&d->object, &d->frame);
++    d->held = false;
++    return PF2_OK;
++}
++
++Pf2Error pf2_decoder_flush(Pf2Decoder *d) {
++    if (!d || !d->opened) return PF2_INVALID;
++    if (d->held) pf2_decoder_release(d);
++    Result rc = videoDecoderFlush(&d->object);
++    return R_SUCCEEDED(rc) ? PF2_OK : sdk_error(d, rc);
++}
++
++void pf2_decoder_close(Pf2Decoder *d) {
++    if (!d) return;
++    if (d->held) pf2_decoder_release(d);
++    if (d->opened) videoDecoderClose(&d->object);
++    free(d->uv);
++    free(d->y);
++    free(d);
++}
++
++uint32_t pf2_decoder_last_sdk_result(const Pf2Decoder *d) {
++    return d ? d->last_sdk_result : 0;
++}
+diff --git a/ports/switch2/native/pf2_h264_units.c b/ports/switch2/native/pf2_h264_units.c
+new file mode 100644
+index 0000000..4473d52
+--- /dev/null
++++ b/ports/switch2/native/pf2_h264_units.c
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Pure input parser; no video decoder/session is started here.
++#include "pf2_native.h"
++#include <string.h>
++
++static size_t start_code(const uint8_t *buf, size_t size, size_t at) {
++    if (at + 3 > size || buf[at] != 0 || buf[at+1] != 0) return 0;
++    if (buf[at+2] == 1) return 3;
++    if (at + 4 <= size && buf[at+2] == 0 && buf[at+3] == 1) return 4;
++    return 0;
++}
++
++// Search only for framing bytes (three/four-byte start code), never parse RBSP.
++// Emulation prevention bytes are irrelevant here as 00 00 03 cannot be a start code.
++static int find_start(const uint8_t *buf, size_t size, size_t from,
++                      size_t *pos, size_t *length) {
++    for (size_t i = from; i + 3 <= size; ++i) {
++        size_t len = start_code(buf, size, i);
++        if (len) { *pos = i; *length = len; return 1; }
++    }
++    return 0;
++}
++
++Pf2Error pf2_h264_config_from_annexb(const uint8_t *buf, size_t len,
++                                    uint8_t *out, size_t capacity, size_t *written) {
++    if (!buf || !out || !written || !len) return PF2_INVALID;
++    *written = 0;
++    size_t offsets[2] = {0}, sizes[2] = {0};
++    size_t from = 0, begin, prefix;
++    while (find_start(buf, len, from, &begin, &prefix)) {
++        const size_t nal_begin = begin + prefix;
++        size_t next, next_prefix;
++        const int has_next = find_start(buf, len, nal_begin, &next, &next_prefix);
++        const size_t end = has_next ? next : len;
++        if (nal_begin < end) {
++            const uint8_t type = buf[nal_begin] & 0x1fu;
++            if ((type == 7 || type == 8) && offsets[type == 8] == 0) {
++                offsets[type == 8] = nal_begin;
++                sizes[type == 8] = end - nal_begin;
++            }
++        }
++        if (!has_next || (offsets[0] && offsets[1])) break;
++        from = next;
++    }
++    if (!sizes[0] || !sizes[1]) return PF2_NOT_READY;
++    if (sizes[0] > SIZE_MAX - sizes[1] - 8) return PF2_INVALID;
++    const size_t total = sizes[0] + sizes[1] + 8;
++    if (capacity < total) return PF2_NO_MEMORY;
++    const uint8_t header[4] = {0,0,0,1};
++    size_t w = 0;
++    for (size_t i = 0; i < 2; ++i) {
++        memcpy(out + w, header, 4); w += 4;
++        memcpy(out + w, buf + offsets[i], sizes[i]); w += sizes[i];
++    }
++    *written = w;
++    return PF2_OK;
++}
+diff --git a/ports/switch2/native/pf2_input_switch2.c b/ports/switch2/native/pf2_input_switch2.c
+new file mode 100644
+index 0000000..27325fe
+--- /dev/null
++++ b/ports/switch2/native/pf2_input_switch2.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Switch 2 native HID sampling. The official pf-nx pad_map remains authoritative
++// for translating these samples into Punktfunk gamepad protocol button bits.
++#include "pf2_native.h"
++#if !defined(__SWITCH2__)
++#error "The native HID backend is Switch 2-only"
++#endif
++#include <switch.h>
++#include <stdlib.h>
++#include <stdbool.h>
++
++struct Pf2Input {
++    PadState states[4];
++    HidVibrationDeviceHandle motors[4][2];
++    bool motor_ready[4];
++    bool connected[4];
++};
++
++Pf2Error pf2_input_open(Pf2Input **out) {
++    if (!out) return PF2_INVALID;
++    *out = NULL;
++    Pf2Input *p = calloc(1, sizeof(*p));
++    if (!p) return PF2_NO_MEMORY;
++    padConfigureInput(4, HidNpadStyleSet_NpadStandard);
++    padInitializeDefault(&p->states[0]);
++    padInitialize(&p->states[1], HidNpadIdType_No2);
++    padInitialize(&p->states[2], HidNpadIdType_No3);
++    padInitialize(&p->states[3], HidNpadIdType_No4);
++    *out = p;
++    return PF2_OK;
++}
++
++Pf2Error pf2_input_poll(Pf2Input *p, Pf2PadRaw out_pads[4]) {
++    if (!p || !out_pads) return PF2_INVALID;
++    for (unsigned i = 0; i < 4; i++) {
++        PadState *pad = &p->states[i];
++        padUpdate(pad);
++        Pf2PadRaw *sample = &out_pads[i];
++        *sample = (Pf2PadRaw) {.slot = i};
++        if (!padIsConnected(pad)) {
++            if (p->connected[i]) pf2_input_rumble(p, i, 0, 0);
++            p->connected[i] = false;
++            p->motor_ready[i] = false;
++            continue; // Clear held buttons on disconnect.
++        }
++        p->connected[i] = true;
++        HidAnalogStickState l = padGetStickPos(pad, 0);
++        HidAnalogStickState r = padGetStickPos(pad, 1);
++        sample->connected = 1;
++        sample->handheld = padIsHandheld(pad);
++        sample->buttons = padGetButtons(pad);
++        sample->left_x = l.x;
++        sample->left_y = l.y;
++        sample->right_x = r.x;
++        sample->right_y = r.y;
++    }
++    return PF2_OK;
++}
++
++Pf2Error pf2_input_rumble(Pf2Input *p, uint32_t slot, uint16_t low, uint16_t high) {
++    if (!p || slot >= 4) return PF2_INVALID;
++    if (!p->connected[slot] && (low || high)) return PF2_NOT_READY;
++    if (!p->motor_ready[slot]) {
++        if (!low && !high) return PF2_OK;
++        HidNpadIdType id = (HidNpadIdType)(HidNpadIdType_No1 + slot);
++        Result rc = hidInitializeVibrationDevices(p->motors[slot], 2, id, HidNpadStyleTag_NpadJoyDual);
++        if (R_FAILED(rc)) rc = hidInitializeVibrationDevices(p->motors[slot], 2, id, HidNpadStyleTag_NpadFullKey);
++        if (R_FAILED(rc)) rc = hidInitializeVibrationDevices(p->motors[slot], 2, id, HidNpadStyleTag_NpadHandheld);
++        if (R_FAILED(rc)) return PF2_UNSUPPORTED;
++        p->motor_ready[slot] = true;
++    }
++    HidVibrationValue value = {
++        .amp_low = (float)low / 65535.0f,
++        .freq_low = 160.0f,
++        .amp_high = (float)high / 65535.0f,
++        .freq_high = 320.0f,
++    };
++    Result rc = hidSendVibrationValues(p->motors[slot], (HidVibrationValue[]){value, value}, 2);
++    return R_SUCCEEDED(rc) ? PF2_OK : PF2_SDK_ERROR;
++}
++
++void pf2_input_release_all(Pf2Input *p) {
++    if (!p) return;
++    for (uint32_t i = 0; i < 4; i++) if (p->motor_ready[i])
++        pf2_input_rumble(p, i, 0, 0);
++}
++
++void pf2_input_close(Pf2Input *p) {
++    pf2_input_release_all(p);
++    free(p);
++}
+diff --git a/ports/switch2/native/pf2_native.h b/ports/switch2/native/pf2_native.h
+new file mode 100644
+index 0000000..e32bd6d
+--- /dev/null
++++ b/ports/switch2/native/pf2_native.h
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Independent Switch 2 native subsystem interface; no Moonlight sources are used.
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct Pf2Decoder Pf2Decoder;
++typedef struct Pf2Presenter Pf2Presenter;
++typedef struct Pf2Audio Pf2Audio;
++
++typedef enum Pf2Error {
++    PF2_OK = 0,
++    PF2_INVALID = -1,
++    PF2_NO_MEMORY = -2,
++    PF2_SDK_ERROR = -3,
++    PF2_NOT_READY = -4,
++    PF2_UNSUPPORTED = -5,
++    PF2_OUT_OF_DATE = -6
++} Pf2Error;
++
++typedef struct Pf2DecodedFrame {
++    uint32_t width;
++    uint32_t height;
++    uint32_t pitch_y;
++    uint32_t pitch_uv;
++    uint64_t pts_ns;
++    const uint8_t *plane_y;
++    const uint8_t *plane_uv;
++} Pf2DecodedFrame;
++
++typedef struct Pf2DecoderSettings {
++    uint32_t width;
++    uint32_t height;
++    uint32_t fps;
++    uint32_t codec;       // 0=H264, 3=AV1 (verified libounce ViddecCodec values)
++    uint32_t image_count;
++    const uint8_t *codec_data;   // H264: Annex B SPS/PPS configuration
++    size_t codec_data_length;
++    uint64_t max_sample_bytes;
++} Pf2DecoderSettings;
++
++// Decoder calls are synchronous and serialized by the caller. Frame pointers remain
++// valid only until the matching pf2_decoder_release; exactly one frame may be held.
++Pf2Error pf2_decoder_open(Pf2Decoder **out, const Pf2DecoderSettings *settings);
++Pf2Error pf2_decoder_submit(Pf2Decoder *decoder, const uint8_t *data,
++                            size_t length, int64_t pts_ns, uint64_t timeout_ns);
++Pf2Error pf2_decoder_acquire(Pf2Decoder *decoder, Pf2DecodedFrame *out,
++                             uint64_t timeout_ns);
++Pf2Error pf2_decoder_release(Pf2Decoder *decoder);
++Pf2Error pf2_decoder_flush(Pf2Decoder *decoder);
++void pf2_decoder_close(Pf2Decoder *decoder);
++uint32_t pf2_decoder_last_sdk_result(const Pf2Decoder *decoder);
++
++typedef enum Pf2ColorMatrix { PF2_BT601 = 0, PF2_BT709 = 1 } Pf2ColorMatrix;
++// Source planes may have larger strides. Destination RGBA is packed with its own stride.
++// Width and height must be even for 4:2:0. Pointer capacities are validated.
++Pf2Error pf2_nv12_rgba(const uint8_t *y, size_t y_bytes, size_t y_stride,
++                       const uint8_t *uv, size_t uv_bytes, size_t uv_stride,
++                       uint32_t width, uint32_t height,
++                       uint8_t *rgba, size_t rgba_bytes, size_t rgba_stride,
++                       Pf2ColorMatrix matrix, int full_range);
++
++Pf2Error pf2_presenter_open(Pf2Presenter **out, uint32_t width, uint32_t height);
++// rgba pointer can be freed as soon as this function returns.
++Pf2Error pf2_presenter_frame(Pf2Presenter *presenter,
++                             const uint8_t *rgba, size_t bytes, size_t stride);
++void pf2_presenter_close(Pf2Presenter *presenter);
++
++Pf2Error pf2_audio_open(Pf2Audio **out, uint32_t rate, uint32_t channels);
++// Blocks until this grain is played. Interleaved float PCM [-1,+1].
++Pf2Error pf2_audio_write(Pf2Audio *audio, const float *pcm, size_t frames);
++void pf2_audio_close(Pf2Audio *audio);
++
++// Raw HID samples from libounce. Deliberately not wire-format gamepad messages:
++// the official application's pad-map must perform protocol mapping later.
++typedef struct Pf2Input Pf2Input;
++typedef struct Pf2PadRaw {
++    uint32_t slot;
++    uint32_t connected;
++    uint32_t handheld;
++    uint64_t buttons;
++    int32_t left_x, left_y, right_x, right_y;
++} Pf2PadRaw;
++Pf2Error pf2_input_open(Pf2Input **out);
++Pf2Error pf2_input_poll(Pf2Input *input, Pf2PadRaw out_pads[4]);
++Pf2Error pf2_input_rumble(Pf2Input *input, uint32_t slot, uint16_t low, uint16_t high);
++void pf2_input_release_all(Pf2Input *input);
++void pf2_input_close(Pf2Input *input);
++
++// Extract H.264 parameter sets from Annex B access units for videoDecoderCreate.
++// Result is two start-coded NAL units (SPS then PPS); insufficient capacity is an error.
++Pf2Error pf2_h264_config_from_annexb(const uint8_t *access_unit, size_t au_size,
++                                    uint8_t *config, size_t capacity, size_t *written);
++
++/* Runtime is allocated once per title. Networking is opened before Quinn starts;
++ * closes only on actual app exit AFTER the official session shutdown. */
++typedef struct Pf2Runtime Pf2Runtime;
++Pf2Error pf2_runtime_open(Pf2Runtime **out);
++/* Flags: 1=focus lost, 2=focus gained, 4=suspend, 8=resume, 16=mode change, 32=exit request.
++ * On exit-request return SUSPEND and leave the app's official shutdown to run. */
++Pf2Error pf2_runtime_poll(Pf2Runtime *r, uint32_t *flags, uint32_t *docked);
++uint32_t pf2_runtime_docked(const Pf2Runtime *r);
++uint32_t pf2_runtime_applet(const Pf2Runtime *r);
++void pf2_runtime_close(Pf2Runtime *r);
++/* Actual OunceVK swapchain extent; may differ from the requested extent. */
++Pf2Error pf2_presenter_size(const Pf2Presenter *p, uint32_t *width, uint32_t *height);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ports/switch2/native/pf2_nv12.c b/ports/switch2/native/pf2_nv12.c
+new file mode 100644
+index 0000000..150d9de
+--- /dev/null
++++ b/ports/switch2/native/pf2_nv12.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++#include "pf2_native.h"
++#include <stdint.h>
++#include <stddef.h>
++
++static uint8_t clamp8(int32_t x) {
++    if (x < 0) return 0;
++    if (x > 255) return 255;
++    return (uint8_t)x;
++}
++static int fits(size_t height, size_t stride, size_t row, size_t cap) {
++    return height != 0 && stride >= row &&
++           (height - 1) <= (SIZE_MAX - row) / stride &&
++           (height - 1) * stride + row <= cap;
++}
++
++Pf2Error pf2_nv12_rgba(const uint8_t *y, size_t y_bytes, size_t y_stride,
++                       const uint8_t *uv, size_t uv_bytes, size_t uv_stride,
++                       uint32_t width, uint32_t height,
++                       uint8_t *rgba, size_t rgba_bytes, size_t rgba_stride,
++                       Pf2ColorMatrix matrix, int full_range) {
++    if (!y || !uv || !rgba || !width || !height || (width & 1) || (height & 1) ||
++        (matrix != PF2_BT601 && matrix != PF2_BT709)) return PF2_INVALID;
++    const size_t w = width, h = height;
++    if (!fits(h, y_stride, w, y_bytes) ||
++        !fits(h / 2, uv_stride, w, uv_bytes) ||
++        !fits(h, rgba_stride, w * 4, rgba_bytes)) return PF2_INVALID;
++    // Fixed-point coefficients are scaled by 256. Conversion is explicitly 8-bit SDR.
++    const int cr = full_range ? (matrix == PF2_BT709 ? 403 : 359)
++                              : (matrix == PF2_BT709 ? 459 : 409);
++    const int cb = full_range ? (matrix == PF2_BT709 ? 475 : 454)
++                              : (matrix == PF2_BT709 ? 541 : 516);
++    const int cg_u = full_range ? (matrix == PF2_BT709 ? 48 : 88)
++                                : (matrix == PF2_BT709 ? 55 : 100);
++    const int cg_v = full_range ? (matrix == PF2_BT709 ? 120 : 183)
++                                : (matrix == PF2_BT709 ? 136 : 208);
++    for (size_t r = 0; r < h; ++r) {
++        const uint8_t *yy = y + r * y_stride;
++        const uint8_t *cc = uv + (r / 2) * uv_stride;
++        uint8_t *dest = rgba + r * rgba_stride;
++        for (size_t col = 0; col < w; ++col) {
++            const int C = full_range ? yy[col] : ((yy[col] > 16) ? yy[col] - 16 : 0);
++            const int U = (int)cc[(col & ~((size_t)1))] - 128;
++            const int V = (int)cc[(col & ~((size_t)1)) + 1] - 128;
++            const int base = full_range ? C * 256 : C * 298;
++            // Limited range uses Rec.601/709 coefficients as defined above.
++            dest[col * 4 + 0] = clamp8((base + cr * V + 128) >> 8);
++            dest[col * 4 + 1] = clamp8((base - cg_u * U - cg_v * V + 128) >> 8);
++            dest[col * 4 + 2] = clamp8((base + cb * U + 128) >> 8);
++            dest[col * 4 + 3] = 255;
++        }
++    }
++    return PF2_OK;
++}
+diff --git a/ports/switch2/native/pf2_runtime_switch2.c b/ports/switch2/native/pf2_runtime_switch2.c
+new file mode 100644
+index 0000000..5655958
+--- /dev/null
++++ b/ports/switch2/native/pf2_runtime_switch2.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Title-wide socket lifecycle and applet events; all used symbols verified
++// against ouncebrew/libounce headers. Avoids shutting down Quinn mid-session.
++#include "pf2_native.h"
++#if !defined(__SWITCH2__)
++#error "Switch 2 runtime required"
++#endif
++#include <switch.h>
++#include <stdlib.h>
++#include <stdbool.h>
++
++struct Pf2Runtime {
++    bool networking;
++    bool exit_locked;
++    bool closing;
++    bool close_sent;
++    AppletOperationMode mode;
++    AppletFocusState focus;
++};
++
++Pf2Error pf2_runtime_open(Pf2Runtime **out) {
++    if (!out) return PF2_INVALID;
++    *out = NULL;
++    Pf2Runtime *r = calloc(1, sizeof(*r));
++    if (!r) return PF2_NO_MEMORY;
++    Result rc = socketInitializeDefault();
++    if (R_FAILED(rc)) { free(r); return PF2_SDK_ERROR; }
++    r->networking = true;
++    r->mode = appletGetOperationMode();
++    r->focus = appletGetFocusState();
++    rc = appletLockExit();
++    if (R_FAILED(rc)) { socketExit(); free(r); return PF2_SDK_ERROR; }
++    r->exit_locked = true;
++    *out = r;
++    return PF2_OK;
++}
++
++Pf2Error pf2_runtime_poll(Pf2Runtime *r, uint32_t *flags, uint32_t *docked) {
++    if (!r || !flags || !docked) return PF2_INVALID;
++    *flags = 0;
++    // appletMainLoop pumps Horizon events; false means exit request.
++    if (!appletMainLoop()) {
++        r->closing = true;
++        if (!r->close_sent) { *flags |= 4 | 32; r->close_sent = true; }
++    }
++    const AppletFocusState focus = appletGetFocusState();
++    if (focus != r->focus) {
++        if (focus == AppletFocusState_InFocus) {
++            *flags |= (r->focus == AppletFocusState_Background ? 8 : 2);
++        } else if (focus == AppletFocusState_Background) {
++            *flags |= 4;
++        } else {
++            *flags |= 1;
++        }
++        r->focus = focus;
++    }
++    const AppletOperationMode mode = appletGetOperationMode();
++    if (mode != r->mode) { *flags |= 16; r->mode = mode; }
++    *docked = mode == AppletOperationMode_Console;
++    return PF2_OK;
++}
++
++uint32_t pf2_runtime_docked(const Pf2Runtime *r) {
++    return r && r->mode == AppletOperationMode_Console;
++}
++
++uint32_t pf2_runtime_applet(const Pf2Runtime *r) {
++    if (!r) return 0;
++    AppletType type = appletGetAppletType();
++    return type != AppletType_Application && type != AppletType_SystemApplication;
++}
++
++void pf2_runtime_close(Pf2Runtime *r) {
++    if (!r) return;
++    if (r->exit_locked) appletUnlockExit();
++    if (r->networking) socketExit();
++    free(r);
++}
+diff --git a/ports/switch2/native/pf2_skia_compat.c b/ports/switch2/native/pf2_skia_compat.c
+new file mode 100644
+index 0000000..4fce118
+--- /dev/null
++++ b/ports/switch2/native/pf2_skia_compat.c
+@@ -0,0 +1,103 @@
++/*
++ * Limited POSIX file-mapping compatibility for Skia/ICU on Switch 2 newlib.
++ * Adapted from the official pinned Punktfunk client-switch
++ * toolchain/skia/compat.c (commit a332988f7509bd4c6fbde7252bd1e2b874019f45).
++ * No Moonlight/Azkali code.
++ *
++ * Only read-only private file mappings are supported. The implementation
++ * returns an allocated copy, not OS virtual memory; it must NOT be used as a
++ * general-purpose mmap substitute. This is not an atomic pread: lseek/read/
++ * lseek can race with other users of the same file descriptor. Hardware and
++ * concurrency behavior still require tests on the target.
++ */
++#if !defined(__SWITCH2__)
++#error "Skia compatibility shim is restricted to the Switch 2 build"
++#endif
++
++#include <errno.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++/* A strong reference to this symbol from the Rust platform ensures the
++ * archive member is extracted, even if link-order changes in rust-lld. */
++void pf2_skia_compat_link_guard(void) { }
++
++/* Newlib's POSIX pread stub is absent on this target. Restore the descriptor's
++ * offset, preserving the original read errno if the read itself failed. */
++ssize_t pf2_skia_file_pread(int fd, void *buf, size_t len, off_t off) {
++    if (off < 0) {
++        errno = EINVAL;
++        return -1;
++    }
++    const off_t original = lseek(fd, 0, SEEK_CUR);
++    if (original == (off_t)-1) return -1;
++    if (lseek(fd, off, SEEK_SET) == (off_t)-1) return -1;
++    const ssize_t got = read(fd, buf, len);
++    const int saved_errno = errno;
++    if (lseek(fd, original, SEEK_SET) == (off_t)-1) {
++        /* Failing to restore the fd position is a real I/O failure. */
++        return -1;
++    }
++    if (got < 0) errno = saved_errno;
++    return got;
++}
++
++/* Skia and ICU use this as a read-only file view. Don't silently grant write
++ * mappings or shared mappings; those semantics cannot be emulated by malloc. */
++void *pf2_skia_readonly_mmap(void *addr, size_t len, int prot,
++                                 int flags, int fd, off_t off) {
++    (void)addr;
++    if (len == 0 || off < 0) {
++        errno = EINVAL;
++        return MAP_FAILED;
++    }
++    if ((prot & PROT_READ) == 0 || (prot & ~PROT_READ) != 0 ||
++        (flags & MAP_PRIVATE) == 0 || (flags & MAP_SHARED) != 0) {
++        errno = ENOSYS;
++        return MAP_FAILED;
++    }
++    void *p = malloc(len);
++    if (!p) {
++        errno = ENOMEM;
++        return MAP_FAILED;
++    }
++    /* Match the official shim's limited full-length-read contract. */
++    const ssize_t n = pf2_skia_file_pread(fd, p, len, off);
++    if (n < 0 || (size_t)n != len) {
++        const int fail_errno = n < 0 ? errno : EIO;
++        free(p);
++        errno = fail_errno;
++        return MAP_FAILED;
++    }
++    return p;
++}
++
++int pf2_skia_readonly_munmap(void *addr, size_t len) {
++    (void)len;
++    free(addr);
++    return 0;
++}
++
++/* Public weak POSIX names are the exact symbols rust-lld said were absent. */
++__attribute__((weak)) ssize_t pread(int fd, void *buf, size_t len, off_t off) {
++    return pf2_skia_file_pread(fd, buf, len, off);
++}
++
++__attribute__((weak)) void *mmap(void *addr, size_t len, int prot,
++                                 int flags, int fd, off_t off) {
++    return pf2_skia_readonly_mmap(addr, len, prot, flags, fd, off);
++}
++
++__attribute__((weak)) int munmap(void *addr, size_t len) {
++    return pf2_skia_readonly_munmap(addr, len);
++}
++
++__attribute__((weak)) int posix_madvise(void *addr, size_t len, int advice) {
++    (void)addr;
++    (void)len;
++    (void)advice;
++    return 0;
++}
+diff --git a/ports/switch2/native/pf2_vulkan_switch2.c b/ports/switch2/native/pf2_vulkan_switch2.c
+new file mode 100644
+index 0000000..292a708
+--- /dev/null
++++ b/ports/switch2/native/pf2_vulkan_switch2.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0
++// Switch 2 OunceVK Vulkan scan-out of caller-provided RGBA pixels.
++// This owns real Vk resources; the Skia Ganesh integration is NOT supplied here.
++#include "pf2_native.h"
++#if !defined(__SWITCH2__)
++#error "OunceVK target required"
++#endif
++#define VK_USE_PLATFORM_VI_NN 1
++#include <switch.h>
++#include <vulkan/vulkan.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++
++#define PF2_MAX_SWAP 8
++struct Pf2Presenter {
++    VkInstance instance;
++    VkSurfaceKHR surface;
++    VkPhysicalDevice physical;
++    VkDevice device;
++    VkQueue queue;
++    uint32_t queue_family;
++    VkSwapchainKHR swap;
++    VkImage images[PF2_MAX_SWAP];
++    uint32_t image_count;
++    VkExtent2D extent;
++    VkFormat format;
++    VkBuffer upload;
++    VkDeviceMemory upload_memory;
++    void *mapped;
++    size_t upload_bytes;
++    bool host_coherent;
++    bool invalidated;  // A changed extent requires close/open to rebuild the upload buffer.
++    VkCommandPool pool;
++    VkCommandBuffer cmd;
++    VkSemaphore acquire;
++    VkSemaphore complete;
++    VkFence fence;
++    uint32_t desired_w, desired_h;
++};
++
++static uint32_t find_memory(VkPhysicalDevice phy, uint32_t bits,
++                             VkMemoryPropertyFlags wanted) {
++    VkPhysicalDeviceMemoryProperties props;
++    vkGetPhysicalDeviceMemoryProperties(phy, &props);
++    for (uint32_t i=0; i<props.memoryTypeCount; i++)
++        if ((bits & (1u << i)) &&
++            (props.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
++    return UINT32_MAX;
++}
++static uint32_t clamp_u32(uint32_t x,uint32_t lo,uint32_t hi) {
++    if (x < lo) return lo;
++    if (x > hi) return hi;
++    return x;
++}
++
++static Pf2Error create_swap(Pf2Presenter *p) {
++    VkSurfaceCapabilitiesKHR caps;
++    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(p->physical,p->surface,&caps)!=VK_SUCCESS)
++        return PF2_SDK_ERROR;
++    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return PF2_UNSUPPORTED;
++    uint32_t count=0;
++    if (vkGetPhysicalDeviceSurfaceFormatsKHR(p->physical,p->surface,&count,NULL)!=VK_SUCCESS || !count)
++        return PF2_SDK_ERROR;
++    VkSurfaceFormatKHR *formats=calloc(count,sizeof(*formats));
++    if (!formats) return PF2_NO_MEMORY;
++    VkResult rc=vkGetPhysicalDeviceSurfaceFormatsKHR(p->physical,p->surface,&count,formats);
++    if (rc!=VK_SUCCESS) { free(formats); return PF2_SDK_ERROR; }
++    VkSurfaceFormatKHR selected={0};
++    bool found=false;
++    for (uint32_t i=0;i<count;i++) {
++        if (formats[i].format==VK_FORMAT_R8G8B8A8_UNORM ||
++            formats[i].format==VK_FORMAT_B8G8R8A8_UNORM) {
++            selected=formats[i];found=true;
++            if (selected.format==VK_FORMAT_R8G8B8A8_UNORM) break;
++        }
++    }
++    free(formats);
++    if (!found) return PF2_UNSUPPORTED;
++    uint32_t n=caps.minImageCount+1;
++    if (caps.maxImageCount && n>caps.maxImageCount) n=caps.maxImageCount;
++    if (n>PF2_MAX_SWAP) return PF2_UNSUPPORTED;
++    VkExtent2D extent=caps.currentExtent;
++    if (extent.width==UINT32_MAX) {
++        extent.width=clamp_u32(p->desired_w,caps.minImageExtent.width,caps.maxImageExtent.width);
++        extent.height=clamp_u32(p->desired_h,caps.minImageExtent.height,caps.maxImageExtent.height);
++    }
++    VkCompositeAlphaFlagBitsKHR alpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    if (!(caps.supportedCompositeAlpha & alpha)) {
++        if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
++            alpha=VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
++        else return PF2_UNSUPPORTED;
++    }
++    VkSurfaceTransformFlagBitsKHR transform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
++        ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
++    VkSwapchainCreateInfoKHR info={0};
++    info.sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
++    info.surface=p->surface;
++    info.minImageCount=n;
++    info.imageFormat=selected.format;
++    info.imageColorSpace=selected.colorSpace;
++    info.imageExtent=extent;
++    info.imageArrayLayers=1;
++    info.imageUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    info.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE;
++    info.preTransform=transform;
++    info.compositeAlpha=alpha;
++    info.presentMode=VK_PRESENT_MODE_FIFO_KHR;
++    info.clipped=VK_TRUE;
++    info.oldSwapchain=p->swap;
++    VkSwapchainKHR next=VK_NULL_HANDLE;
++    rc=vkCreateSwapchainKHR(p->device,&info,NULL,&next);
++    if (rc!=VK_SUCCESS) return PF2_SDK_ERROR;
++    count=0;
++    rc=vkGetSwapchainImagesKHR(p->device,next,&count,NULL);
++    if (rc!=VK_SUCCESS || count>PF2_MAX_SWAP || !count) {
++        vkDestroySwapchainKHR(p->device,next,NULL);return PF2_UNSUPPORTED;
++    }
++    VkImage images[PF2_MAX_SWAP]={0};
++    rc=vkGetSwapchainImagesKHR(p->device,next,&count,images);
++    if (rc!=VK_SUCCESS) {vkDestroySwapchainKHR(p->device,next,NULL);return PF2_SDK_ERROR;}
++    if (p->swap) vkDestroySwapchainKHR(p->device,p->swap,NULL);
++    p->swap=next;p->extent=extent;p->format=selected.format;p->image_count=count;
++    memcpy(p->images,images,count*sizeof(VkImage));
++    return PF2_OK;
++}
++
++static Pf2Error open_upload(Pf2Presenter *p) {
++    if ((size_t)p->extent.width > SIZE_MAX / (size_t)p->extent.height / 4) return PF2_INVALID;
++    size_t bytes=(size_t)p->extent.width*p->extent.height*4;
++    VkBufferCreateInfo bi={0};
++    bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bi.size=bytes;bi.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
++    if (vkCreateBuffer(p->device,&bi,NULL,&p->upload)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkMemoryRequirements req;
++    vkGetBufferMemoryRequirements(p->device,p->upload,&req);
++    uint32_t type=find_memory(p->physical,req.memoryTypeBits,
++        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    p->host_coherent=true;
++    if (type==UINT32_MAX) {
++        type=find_memory(p->physical,req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
++        p->host_coherent=false;
++    }
++    if (type==UINT32_MAX) return PF2_UNSUPPORTED;
++    VkMemoryAllocateInfo ai={0};
++    ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    ai.allocationSize=req.size;
++    ai.memoryTypeIndex=type;
++    if (vkAllocateMemory(p->device,&ai,NULL,&p->upload_memory)!=VK_SUCCESS) return PF2_NO_MEMORY;
++    if (vkBindBufferMemory(p->device,p->upload,p->upload_memory,0)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    if (vkMapMemory(p->device,p->upload_memory,0,VK_WHOLE_SIZE,0,&p->mapped)!=VK_SUCCESS)
++        return PF2_SDK_ERROR;
++    p->upload_bytes=bytes;
++    return PF2_OK;
++}
++static Pf2Error frame_objects(Pf2Presenter *p) {
++    VkCommandPoolCreateInfo pci={0};
++    pci.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    pci.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pci.queueFamilyIndex=p->queue_family;
++    if (vkCreateCommandPool(p->device,&pci,NULL,&p->pool)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkCommandBufferAllocateInfo cai={0};
++    cai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    cai.commandPool=p->pool;cai.commandBufferCount=1;cai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    if (vkAllocateCommandBuffers(p->device,&cai,&p->cmd)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkSemaphoreCreateInfo si={0};si.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++    if (vkCreateSemaphore(p->device,&si,NULL,&p->acquire)!=VK_SUCCESS ||
++        vkCreateSemaphore(p->device,&si,NULL,&p->complete)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkFenceCreateInfo fi={0};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
++    return vkCreateFence(p->device,&fi,NULL,&p->fence)==VK_SUCCESS ? PF2_OK:PF2_SDK_ERROR;
++}
++
++Pf2Error pf2_presenter_open(Pf2Presenter **out, uint32_t width, uint32_t height) {
++    if (!out || width<2 || height<2 || width>8192 || height>8192) return PF2_INVALID;
++    *out=NULL;
++    Pf2Presenter *p=calloc(1,sizeof(*p));
++    if (!p) return PF2_NO_MEMORY;
++    p->desired_w=width;p->desired_h=height;
++    const char *extensions[]={VK_KHR_SURFACE_EXTENSION_NAME,VK_NN_VI_SURFACE_EXTENSION_NAME};
++    VkApplicationInfo ai={0};
++    ai.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO;ai.pApplicationName="Punktfunk Switch 2";
++    ai.apiVersion=VK_API_VERSION_1_3;
++    VkInstanceCreateInfo ii={0};
++    ii.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++    ii.pApplicationInfo=&ai;ii.enabledExtensionCount=2;ii.ppEnabledExtensionNames=extensions;
++    if (vkCreateInstance(&ii,NULL,&p->instance)!=VK_SUCCESS) goto failed;
++    VkViSurfaceCreateInfoNN surface={0};
++    surface.sType=VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
++    surface.window=nwindowGetDefault();
++    if (vkCreateViSurfaceNN(p->instance,&surface,NULL,&p->surface)!=VK_SUCCESS) goto failed;
++    uint32_t count=0;
++    if (vkEnumeratePhysicalDevices(p->instance,&count,NULL)!=VK_SUCCESS || !count) goto failed;
++    VkPhysicalDevice *phys=calloc(count,sizeof(*phys));
++    if (!phys) goto failed;
++    VkResult rc=vkEnumeratePhysicalDevices(p->instance,&count,phys);
++    if (rc==VK_SUCCESS) for (uint32_t i=0; i<count && !p->physical; i++) {
++        uint32_t families=0;
++        vkGetPhysicalDeviceQueueFamilyProperties(phys[i],&families,NULL);
++        VkQueueFamilyProperties *props=calloc(families,sizeof(*props));
++        if (!props) continue;
++        vkGetPhysicalDeviceQueueFamilyProperties(phys[i],&families,props);
++        for (uint32_t j=0;j<families;j++) {
++            VkBool32 present=VK_FALSE;
++            vkGetPhysicalDeviceSurfaceSupportKHR(phys[i],j,p->surface,&present);
++            if ((props[j].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
++                p->physical=phys[i];p->queue_family=j;break;
++            }
++        }
++        free(props);
++    }
++    free(phys);
++    if (!p->physical) goto failed;
++    float priority=1.0f;
++    VkDeviceQueueCreateInfo qi={0};
++    qi.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
++    qi.queueFamilyIndex=p->queue_family;qi.queueCount=1;qi.pQueuePriorities=&priority;
++    const char *dev_ext[]={VK_KHR_SWAPCHAIN_EXTENSION_NAME};
++    VkDeviceCreateInfo di={0};
++    di.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
++    di.queueCreateInfoCount=1;di.pQueueCreateInfos=&qi;
++    di.enabledExtensionCount=1;di.ppEnabledExtensionNames=dev_ext;
++    if (vkCreateDevice(p->physical,&di,NULL,&p->device)!=VK_SUCCESS) goto failed;
++    vkGetDeviceQueue(p->device,p->queue_family,0,&p->queue);
++    if (create_swap(p)!=PF2_OK || open_upload(p)!=PF2_OK || frame_objects(p)!=PF2_OK)
++        goto failed;
++    *out=p;
++    return PF2_OK;
++failed:
++    pf2_presenter_close(p);
++    return PF2_SDK_ERROR;
++}
++
++static void image_transition(VkCommandBuffer cmd,VkImage img,VkImageLayout before,
++                             VkImageLayout after,VkAccessFlags from,VkAccessFlags to) {
++    VkImageMemoryBarrier b={0};
++    b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    b.oldLayout=before;b.newLayout=after;
++    b.srcAccessMask=from;b.dstAccessMask=to;
++    b.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
++    b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
++    b.image=img;
++    b.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
++    b.subresourceRange.levelCount=1;b.subresourceRange.layerCount=1;
++    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                         0,0,NULL,0,NULL,1,&b);
++}
++
++Pf2Error pf2_presenter_frame(Pf2Presenter *p,const uint8_t *rgba,size_t bytes,size_t stride) {
++    if (!p || !rgba || !p->device || !p->mapped || !p->swap) return PF2_INVALID;
++    if (p->invalidated) return PF2_OUT_OF_DATE;
++    const uint32_t w=p->extent.width,h=p->extent.height;
++    if (stride < (size_t)w*4 || bytes < stride*(size_t)(h-1)+(size_t)w*4)
++        return PF2_INVALID;
++    if (vkWaitForFences(p->device,1,&p->fence,VK_TRUE,UINT64_MAX)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    for (uint32_t y=0;y<h;y++) {
++        const uint8_t *src=rgba+(size_t)y*stride;
++        uint8_t *dst=(uint8_t*)p->mapped+(size_t)y*w*4;
++        if (p->format==VK_FORMAT_R8G8B8A8_UNORM) memcpy(dst,src,(size_t)w*4);
++        else for (uint32_t x=0;x<w;x++) {
++            dst[x*4+0]=src[x*4+2];dst[x*4+1]=src[x*4+1];
++            dst[x*4+2]=src[x*4+0];dst[x*4+3]=src[x*4+3];
++        }
++    }
++    if (!p->host_coherent) {
++        VkMappedMemoryRange range={0};range.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++        range.memory=p->upload_memory;range.offset=0;range.size=VK_WHOLE_SIZE;
++        if (vkFlushMappedMemoryRanges(p->device,1,&range)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    }
++    uint32_t index=0;
++    VkResult rc=vkAcquireNextImageKHR(p->device,p->swap,UINT64_MAX,p->acquire,VK_NULL_HANDLE,&index);
++    if (rc==VK_ERROR_OUT_OF_DATE_KHR) {
++        vkDeviceWaitIdle(p->device);
++        if (create_swap(p)!=PF2_OK) { p->invalidated=true; return PF2_OUT_OF_DATE; }
++        // On extent change caller must provide a newly sized RGBA image. Upload also needs recreation.
++        if (p->extent.width!=w || p->extent.height!=h) {
++            p->invalidated=true; return PF2_OUT_OF_DATE;
++        }
++        rc=vkAcquireNextImageKHR(p->device,p->swap,UINT64_MAX,p->acquire,VK_NULL_HANDLE,&index);
++    }
++    if ((rc!=VK_SUCCESS && rc!=VK_SUBOPTIMAL_KHR) || index>=p->image_count) return PF2_SDK_ERROR;
++    if (vkResetCommandBuffer(p->cmd,0)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkCommandBufferBeginInfo bi={0};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (vkBeginCommandBuffer(p->cmd,&bi)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    image_transition(p->cmd,p->images[index],VK_IMAGE_LAYOUT_UNDEFINED,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,VK_ACCESS_TRANSFER_WRITE_BIT);
++    VkBufferImageCopy region={0};
++    region.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
++    region.imageSubresource.layerCount=1;
++    region.imageExtent.width=w;region.imageExtent.height=h;region.imageExtent.depth=1;
++    vkCmdCopyBufferToImage(p->cmd,p->upload,p->images[index],
++                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
++    image_transition(p->cmd,p->images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_ACCESS_TRANSFER_WRITE_BIT,0);
++    if (vkEndCommandBuffer(p->cmd)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    if (vkResetFences(p->device,1,&p->fence)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TRANSFER_BIT;
++    VkSubmitInfo submit={0};submit.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submit.waitSemaphoreCount=1;submit.pWaitSemaphores=&p->acquire;
++    submit.pWaitDstStageMask=&stage;submit.commandBufferCount=1;submit.pCommandBuffers=&p->cmd;
++    submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&p->complete;
++    if (vkQueueSubmit(p->queue,1,&submit,p->fence)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    VkPresentInfoKHR present={0};present.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
++    present.waitSemaphoreCount=1;present.pWaitSemaphores=&p->complete;
++    present.swapchainCount=1;present.pSwapchains=&p->swap;present.pImageIndices=&index;
++    rc=vkQueuePresentKHR(p->queue,&present);
++    // One in-flight frame: wait until present consumes the binary signal semaphore.
++    if (vkQueueWaitIdle(p->queue)!=VK_SUCCESS) return PF2_SDK_ERROR;
++    if (rc==VK_ERROR_OUT_OF_DATE_KHR || rc==VK_SUBOPTIMAL_KHR) {
++        p->invalidated=true; return PF2_OUT_OF_DATE;
++    }
++    return rc==VK_SUCCESS ? PF2_OK:PF2_SDK_ERROR;
++}
++
++void pf2_presenter_close(Pf2Presenter *p) {
++    if (!p) return;
++    if (p->device) vkDeviceWaitIdle(p->device);
++    if (p->mapped) vkUnmapMemory(p->device,p->upload_memory);
++    if (p->fence) vkDestroyFence(p->device,p->fence,NULL);
++    if (p->complete) vkDestroySemaphore(p->device,p->complete,NULL);
++    if (p->acquire) vkDestroySemaphore(p->device,p->acquire,NULL);
++    if (p->pool) vkDestroyCommandPool(p->device,p->pool,NULL);
++    if (p->upload) vkDestroyBuffer(p->device,p->upload,NULL);
++    if (p->upload_memory) vkFreeMemory(p->device,p->upload_memory,NULL);
++    if (p->swap) vkDestroySwapchainKHR(p->device,p->swap,NULL);
++    if (p->device) vkDestroyDevice(p->device,NULL);
++    if (p->surface) vkDestroySurfaceKHR(p->instance,p->surface,NULL);
++    if (p->instance) vkDestroyInstance(p->instance,NULL);
++    free(p);
++}
++
++Pf2Error pf2_presenter_size(const Pf2Presenter *p, uint32_t *width, uint32_t *height) {
++    if (!p || !width || !height || !p->swap) return PF2_INVALID;
++    *width = p->extent.width;
++    *height = p->extent.height;
++    return PF2_OK;
++}

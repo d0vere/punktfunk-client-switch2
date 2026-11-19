@@ -1,0 +1,30 @@
+name: Switch 2 host regression checks
+
+on:
+  push:
+    paths:
+      - 'crates/pf-nx-switch2-platform/**'
+      - 'ports/switch2/native/**'
+      - 'switch2/**'
+      - 'build-switch2.sh'
+      - '.github/workflows/switch2-host.yml'
+  pull_request:
+    paths:
+      - 'crates/pf-nx-switch2-platform/**'
+      - 'ports/switch2/native/**'
+      - 'switch2/**'
+      - 'build-switch2.sh'
+      - '.github/workflows/switch2-host.yml'
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Python and sanitized C regression tests (not a Switch 2 build)
+        run: bash build-switch2.sh --test
+      - name: Shell syntax
+        run: bash -n build-switch2.sh switch2/build_full.sh switch2/tooling/*.sh

@@ -1,0 +1,16 @@
+# devkitA64's GCC and the Switch's CPU flags for C built through cc-rs, with libnx's headers for
+# sockets and `__SWITCH__` as devkitPro's own rules set it. With -mtp=soft, C reads the thread
+# pointer through libnx, which the probe's `userAppInit` and thread wrapper keep equal to
+# TPIDR_EL0 (bevy-horizon's `.cargo/config.toml`).
+[env]
+CC_aarch64_nintendo_horizon = "aarch64-none-elf-gcc"
+CFLAGS_aarch64_nintendo_horizon = "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE -D__SWITCH__ -isystem /opt/devkitpro/libounce/include"
+CXX_aarch64_nintendo_horizon = "aarch64-none-elf-g++"
+CXXFLAGS_aarch64_nintendo_horizon = "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE -D__SWITCH__ -isystem /opt/devkitpro/libounce/include"
+AR_aarch64_nintendo_horizon = "aarch64-none-elf-gcc-ar"
+
+# Only libc must reach rust-src's separate workspace under -Z build-std.
+# Client-only patches live in the root Cargo.toml so rust-src doesn't warn about
+# unused getrandom/mio/quinn-udp/tokio patches. Keep this libc leg for std::net.
+[patch.crates-io]
+libc = { path = "toolchain/patches/libc" }

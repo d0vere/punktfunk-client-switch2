@@ -1,0 +1,1114 @@
+//! The application shell as a relm4 component tree: [`AppModel`] owns the window, the
+//! [`Store`], navigation, and the spawned session children's lives. Hosts and Library are
+//! child components, the two destinations of one view stack (design §2.1); dialogs are plain
+//! GTK invoked from `update`. The connect flow is in `connect.rs`, host requests beside a
+//! stream in `host_ops.rs`. Every stream runs in the `punktfunk-session` Vulkan binary —
+//! the shell never touches video.
+
+mod connect;
+pub mod gate;
+mod host_ops;
+mod profile;
+pub mod spawn;
+mod unlock;
+
+use crate::hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage, Phase};
+use crate::library::{LibraryInit, LibraryMsg, LibraryOutput, LibraryPage};
+use crate::store::{Changed, Store};
+use crate::trust;
+use adw::prelude::*;
+use gtk::{gdk, gio, glib};
+use pf_client_core::orchestrate::{
+    self, trust_route, ConnectAttempt, ConnectOutcome, ExitRoute, HostTarget, TrustRoute,
+};
+use pf_client_core::profiles::{ListedProfile as ProfileRow, ProfilePick};
+use pf_client_core::settings::GamepadUi;
+use pf_client_core::start;
+use pf_client_core::unlock::{starting_line, Pending};
+use pf_l10n::{client, desktop};
+use relm4::prelude::*;
+use spawn::{CancelHandle, SpawnOpts};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+pub const APP_ID: &str = "io.unom.punktfunk";
+
+/// How long a session asked to quit gets to close the host before it is killed.
+const DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Everything the shell shares below the component tree.
+pub struct AppModel {
+    pub window: adw::ApplicationWindow,
+    pub nav: adw::NavigationView,
+    toasts: adw::ToastOverlay,
+    pub store: Rc<Store>,
+    pub identity: (String, String),
+    /// App-lifetime SDL gamepad service (Settings' controller list + pinning). Streams
+    /// run in the session binary, which has its own.
+    pub gamepad: crate::gamepad::GamepadService,
+    /// Device lists for the settings pickers (GPUs via `punktfunk-session
+    /// --list-adapters` — the shell deliberately links no Vulkan itself — and audio
+    /// endpoints via the PipeWire registry), probed once at startup on a worker thread.
+    /// Empty until the probe lands — empty lists simply hide their pickers.
+    pub probes: Rc<RefCell<crate::settings::DeviceProbes>>,
+    hosts: Controller<HostsPage>,
+    library: Controller<LibraryPage>,
+    /// Hosts · Library.
+    views: adw::ViewStack,
+    /// One connect per host: whatever asks for a host while its own is in flight is ignored.
+    flights: connect::Flights,
+    /// Controllers attached at the last poll — the edge Controller-optimized UI opens on.
+    pads: usize,
+    /// Fullscreen Always put the window there, so turning it off may take it back out.
+    fullscreen_by_setting: bool,
+    /// "Streaming from …" on both pages, with Disconnect.
+    streaming: Banners,
+}
+
+#[derive(Debug)]
+pub enum AppMsg {
+    /// A `punktfunk://` URL arrived (scheme handler, a shortcut, or a second invocation
+    /// forwarded to this instance by GApplication) — design/client-deep-links.md §4.1.
+    DeepLink(String),
+    /// The trust gate in front of every connect (see `AppModel::connect`).
+    Connect(ConnectRequest),
+    /// Connect to a saved host that isn't advertising but has a known MAC: fire a wake
+    /// packet and DIAL IMMEDIATELY (mDNS absence ≠ unreachable — routed/Tailscale hosts
+    /// never advertise here); only a failed dial falls into the visible wake-and-wait.
+    WakeConnect(ConnectRequest),
+    /// The SPAKE2 PIN ceremony dialog.
+    Pair(ConnectRequest),
+    SpeedTest(ConnectRequest),
+    /// The Library on this host's shelf.
+    OpenLibrary(ConnectRequest),
+    /// "Switch profile…": the picker without a connect.
+    SwitchProfile(ConnectRequest),
+    /// The profile list came back (`None`: the ask failed or ran late).
+    ProfileAsked {
+        req: ConnectRequest,
+        fp_hex: String,
+        switch: bool,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
+    /// A circle in the picker was chosen.
+    ProfilePicked {
+        req: ConnectRequest,
+        fp_hex: String,
+        row: ProfileRow,
+        connect: bool,
+    },
+    /// The host refused the dialed profile as unknown; its list came back (`None`: the read
+    /// failed or ran late). `msg` is the refusal, shown when the profile is gone.
+    ProfileReasked {
+        req: ConnectRequest,
+        fp_hex: String,
+        id: String,
+        msg: String,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
+    /// A seat poll's row, or the line that ends the wait. `stop` names the wait it belongs to.
+    SeatPolled {
+        stop: Arc<AtomicBool>,
+        row: Result<ProfileRow, String>,
+    },
+    /// The seat dialog closed by Cancel or Escape.
+    SeatCancelled(Arc<AtomicBool>),
+    /// The password prompt for `row`, with `error` above its field.
+    UnlockPrompt {
+        req: ConnectRequest,
+        fp_hex: String,
+        row: ProfileRow,
+        redial: bool,
+        error: Option<String>,
+    },
+    /// The host refused profile `id`'s unlock; its list came back for the prompt (`None`: the
+    /// read failed or ran late).
+    UnlockReasked {
+        req: ConnectRequest,
+        fp_hex: String,
+        id: String,
+        error: Option<String>,
+        /// The refused dial carried an unlock.
+        sent: bool,
+        listed: Option<Option<Vec<ProfileRow>>>,
+    },
+    /// Show a destination by its view name.
+    ShowView(&'static str),
+    Find,
+    /// Rescan the network, or reload the shelf.
+    Reload,
+    /// Spawn the session child now (trust already decided; `tofu` = persist the
+    /// fingerprint once the child proves it).
+    StartSession {
+        req: ConnectRequest,
+        fp_hex: String,
+        tofu: bool,
+        opts: SpawnOpts,
+    },
+    /// The child presented its first frame.
+    SessionReady {
+        req: ConnectRequest,
+        fp_hex: String,
+    },
+    /// The child exited (the session is over, or the connect failed).
+    SessionExited {
+        req: ConnectRequest,
+        code: i32,
+        error: Option<pf_client_core::orchestrate::SessionError>,
+        ended: Option<String>,
+    },
+    /// Hand over to the gamepad console (`punktfunk-session --browse`) — the couch UI's
+    /// door from the desktop shell.
+    OpenConsole,
+    /// The attached controller count changed (a 1 s poll).
+    Pads(usize),
+    /// Preferences closed: re-read what the window itself follows.
+    SettingsClosed,
+    ToggleFullscreen,
+    /// The console child exited; `Some` is the banner for one that ended badly.
+    ConsoleExited(Option<String>),
+    /// Upload the client log ring to this paired host (`logring::send_to_host`); the
+    /// outcome lands as a Toast either way. The mgmt port rides along when an advert has one.
+    SendLogs(ConnectRequest, Option<u16>),
+    /// Run one of the host's own actions — sleep / restart / shut down it
+    /// (`design/host-actions.md` §7). `danger` asks first; the outcome is a toast.
+    HostAction {
+        req: ConnectRequest,
+        mgmt: Option<u16>,
+        action_id: String,
+        label: String,
+        danger: bool,
+    },
+    /// The speed-test page resolved, either way: it frees the slot.
+    SpeedTestDone,
+    ShowPreferences,
+    /// Re-open Preferences editing a specific layer — the settings scope switcher's
+    /// destination (design/client-settings-profiles.md §5.1).
+    ShowPreferencesScoped(crate::settings::Scope),
+    ShowShortcuts,
+    ShowAbout,
+    ShowAddHost,
+    /// End this card key's stream the way its window does, or every stream with `None`.
+    Disconnect(Option<String>),
+    Toast(String),
+    /// A title left the Library's shelf: the line, with Undo for the title's id.
+    Hidden(String, String),
+    /// A plain connect the host parked for its operator: show the waiting dialog.
+    AwaitingApproval(ConnectRequest),
+}
+
+pub struct AppInit {
+    pub gamepad: crate::gamepad::GamepadService,
+}
+
+pub struct AppWidgets {}
+
+impl SimpleComponent for AppModel {
+    type Init = AppInit;
+    type Input = AppMsg;
+    type Output = ();
+    type Root = adw::ApplicationWindow;
+    type Widgets = AppWidgets;
+
+    fn init_root() -> Self::Root {
+        // The minimum size is what the narrow breakpoint is checked against.
+        adw::ApplicationWindow::builder()
+            .title("Punktfunk")
+            .default_width(1200)
+            .default_height(780)
+            .width_request(360)
+            .height_request(294)
+            .build()
+    }
+
+    fn init(
+        init: Self::Init,
+        window: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let identity = match trust::load_or_create_identity() {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!("client identity: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        install_resources();
+        load_css();
+        // Screenshot scenes must capture settled frames: kill every GTK/libadwaita
+        // animation (a headless session may starve the frame clock and leave a
+        // transition frozen mid-flight in the capture).
+        if crate::shots::shot_scene().is_some() {
+            if let Some(s) = gtk::Settings::default() {
+                s.set_gtk_enable_animations(false);
+            }
+        }
+
+        let store = Store::open();
+        match crate::shots::shot_size() {
+            Some((w, h)) => window.set_default_size(w, h),
+            None if crate::shots::shot_scene().is_none() => remember_size(&window, &store),
+            None => {}
+        }
+        // Recolour the shell from the desktop theme (Omarchy only; one stat everywhere else).
+        // Every colour in `data/style.css` resolves through libadwaita's named palette, so
+        // redefining those names is all it takes. After the settings load, because the
+        // "Follow the Omarchy theme" switch decides whether it draws.
+        crate::desktop::omarchy::install(store.settings().follow_os_theme);
+        // Device lists for the settings pickers: probe in the background, ready long
+        // before the dialog opens. A missing session binary or absent PipeWire just
+        // leaves the corresponding list empty (and its picker hidden).
+        let probes: Rc<RefCell<crate::settings::DeviceProbes>> = Rc::default();
+        {
+            let (tx, rx) = async_channel::bounded::<crate::settings::DeviceProbes>(1);
+            std::thread::spawn(move || {
+                let adapters: Vec<String> = crate::app::spawn::session_process()
+                    .arg("--list-adapters")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
+                let _ = tx.send_blocking(crate::settings::DeviceProbes {
+                    adapters,
+                    speakers,
+                    mics,
+                });
+            });
+            let probes = probes.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(found) = rx.recv().await {
+                    *probes.borrow_mut() = found;
+                }
+            });
+        }
+        // Re-apply the persisted forwarded-controller pin (stable key; the service
+        // matches it whenever such a pad connects).
+        {
+            let forward = store.settings().forward_pad.clone();
+            if !forward.is_empty() {
+                init.gamepad.set_pinned(Some(forward));
+            }
+        }
+
+        let nav = adw::NavigationView::new();
+        let views = adw::ViewStack::new();
+        let narrow = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 550sp").expect("a breakpoint condition"),
+        );
+        window.add_breakpoint(narrow.clone());
+        let hosts = HostsPage::builder()
+            .launch(hosts::HostsInit {
+                store: store.clone(),
+                identity: identity.clone(),
+                nav: nav.clone(),
+                views: views.clone(),
+                narrow: narrow.clone(),
+            })
+            .forward(sender.input_sender(), |out| match out {
+                HostsOutput::Connect(req) => AppMsg::Connect(req),
+                HostsOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
+                HostsOutput::Pair(req) => AppMsg::Pair(req),
+                HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
+                HostsOutput::Library(req) => AppMsg::OpenLibrary(req),
+                HostsOutput::SwitchProfile(req) => AppMsg::SwitchProfile(req),
+                HostsOutput::Disconnect(key) => AppMsg::Disconnect(Some(key)),
+                HostsOutput::SendLogs(req, mgmt) => AppMsg::SendLogs(req, mgmt),
+                HostsOutput::HostAction {
+                    req,
+                    mgmt,
+                    action_id,
+                    label,
+                    danger,
+                } => AppMsg::HostAction {
+                    req,
+                    mgmt,
+                    action_id,
+                    label,
+                    danger,
+                },
+                HostsOutput::Toast(msg) => AppMsg::Toast(msg),
+            });
+
+        let library = LibraryPage::builder()
+            .launch(LibraryInit {
+                store: store.clone(),
+                identity: identity.clone(),
+                views: views.clone(),
+                narrow,
+            })
+            .forward(sender.input_sender(), |out| match out {
+                LibraryOutput::Connect(req) => AppMsg::Connect(req),
+                LibraryOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
+                LibraryOutput::Toast(msg) => AppMsg::Toast(msg),
+                LibraryOutput::Hidden(msg, id) => AppMsg::Hidden(msg, id),
+                LibraryOutput::ShowHosts => AppMsg::ShowView("hosts"),
+                LibraryOutput::Pair(req) => AppMsg::Pair(req),
+            });
+        views.add_titled_with_icon(
+            hosts.widget(),
+            Some("hosts"),
+            client::hosts_tab(),
+            "computer-symbolic",
+        );
+        views.add_titled_with_icon(
+            library.widget(),
+            Some("library"),
+            client::hosts_tab_library(),
+            "applications-games-symbolic",
+        );
+        let pages = [hosts.widget().clone(), library.widget().clone()];
+        store_health_banner(&pages, &store);
+        let streaming = Banners::new(&pages, {
+            let sender = sender.clone();
+            move || sender.input(AppMsg::Disconnect(None))
+        });
+        nav.add(
+            &adw::NavigationPage::builder()
+                .title("Punktfunk")
+                .tag("main")
+                .child(&views)
+                .build(),
+        );
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&nav));
+        window.set_content(Some(&toasts));
+
+        let mut model = AppModel {
+            window: window.clone(),
+            nav,
+            toasts,
+            store,
+            identity,
+            gamepad: init.gamepad,
+            probes,
+            hosts,
+            library,
+            views,
+            flights: connect::Flights::default(),
+            pads: 0,
+            streaming,
+            fullscreen_by_setting: false,
+        };
+        install_actions(&model.window, &sender);
+        // Controller-optimized UI reads the count on every change; the service has no event
+        // for a pad arriving, and a 1 s poll is one lock and a short Vec.
+        if cfg!(feature = "console") && crate::shots::shot_scene().is_none() {
+            let (gamepad, sender) = (model.gamepad.clone(), sender.clone());
+            let mut last = 0;
+            glib::timeout_add_seconds_local(1, move || {
+                let n = gamepad.pads().len();
+                if n != last {
+                    last = n;
+                    sender.input(AppMsg::Pads(n));
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
+        // CI screenshot mode: dispatch the scripted scene once the window is actually
+        // mapped (AdwDialogs need a live window; relm4 maps it after `init` returns, so
+        // this can't run inline like the pre-relm4 `activate` path did).
+        if let Some(scene) = crate::shots::shot_scene() {
+            let ctx = crate::shots::ShotCtx {
+                window: model.window.clone(),
+                hosts: model.hosts.sender().clone(),
+                library: model.library.sender().clone(),
+                views: model.views.clone(),
+                store: model.store.clone(),
+                gamepad: model.gamepad.clone(),
+                identity: model.identity.clone(),
+                sender: sender.clone(),
+            };
+            let fired = std::cell::Cell::new(false);
+            model.window.connect_map(move |_| {
+                if fired.replace(true) {
+                    return; // map can fire more than once; the scene runs on the first
+                }
+                crate::shots::run_shot(&ctx, &scene);
+            });
+        }
+        window.present();
+        model.apply_fullscreen();
+
+        // The deep-link seam is live from here: anything GApplication delivered during a cold
+        // start has been parked, and everything from now on arrives as a message.
+        LINK_TX.with_borrow_mut(|tx| *tx = Some(sender.input_sender().clone()));
+        let parked = PENDING_LINKS.with_borrow_mut(std::mem::take);
+        // Where a bare launch opens (design/default-host.md). Only a bare one: `--connect`,
+        // `--browse` and every headless verb have already exec'd or returned before the
+        // application object exists, and a link is explicit intent that wins outright. A link
+        // that launched this process is not parked yet: GApplication's `open` follows startup.
+        let bare = parked.is_empty() && crate::cli::deep_link_arg().is_none();
+        let console_home = cfg!(feature = "console")
+            && crate::shots::shot_scene().is_none()
+            && model.store.settings().gamepad_ui() == GamepadUi::Always;
+        if bare && console_home {
+            // The console follows Start in itself.
+            sender.input(AppMsg::OpenConsole);
+        } else if bare {
+            let settings = model.store.settings();
+            let known = model.store.hosts();
+            let (default, source) = start::default_host_with_source(&settings, &known);
+            tracing::info!(
+                start_in = start::StartIn::parse(&settings.start_in).as_str(),
+                default = default.map_or("none", |i| known.hosts[i].name.as_str()),
+                source = source.as_str(),
+                "client start"
+            );
+            let screen = start::start_screen(&settings, &known);
+            drop(settings);
+            if let Some(i) = screen.host_index() {
+                let req = ConnectRequest {
+                    host: HostTarget::from(&known.hosts[i]),
+                    ..ConnectRequest::default()
+                };
+                sender.input(AppMsg::OpenLibrary(req.clone()));
+                // Stream is the library PLUS a connect, never a screen of its own: the session
+                // window is the overlay, so ending it leaves the shelf on screen underneath.
+                if matches!(screen, start::Start::Stream(_)) {
+                    sender.input(AppMsg::WakeConnect(req));
+                }
+            }
+        }
+        for url in parked {
+            sender.input(AppMsg::DeepLink(url));
+        }
+
+        ComponentParts {
+            model,
+            widgets: AppWidgets {},
+        }
+    }
+
+    fn update(&mut self, msg: AppMsg, sender: ComponentSender<Self>) {
+        match msg {
+            AppMsg::DeepLink(url) => self.open_deep_link(&url, &sender),
+            AppMsg::Connect(req) => self.connect(req, &sender),
+            AppMsg::WakeConnect(req) => {
+                let key = req.card_key();
+                if !self.flights.busy(&key) {
+                    // Never gate the dial on mDNS presence: a routed host (Tailscale/VPN) never
+                    // advertises. The magic packet goes first, fire-and-forget, so an asleep box
+                    // boots while the dial times out, and the fallback is armed for THIS request.
+                    // Auto-wake off means no packet and no wake-and-wait, just the normal dial
+                    // error; the host-card menu's explicit "Wake host" stays ungated.
+                    if self.store.settings().auto_wake {
+                        crate::wol::wake(&req.host.mac, req.host.addr.parse().ok());
+                        self.flights.of(&key).attempt.arm_wake(&req.host);
+                    }
+                    sender.input(AppMsg::Connect(req));
+                }
+            }
+            AppMsg::Pair(req) => {
+                if !self.flights.busy(&req.card_key()) {
+                    crate::app::gate::pin_dialog(
+                        &self.window,
+                        &sender,
+                        self.identity.clone(),
+                        req,
+                        false,
+                    );
+                }
+            }
+            AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
+            AppMsg::SwitchProfile(req) => {
+                if let Some(fp_hex) = req.host.pin().map(str::to_string) {
+                    self.ask_profile(req, fp_hex, true, &sender);
+                }
+            }
+            AppMsg::ProfileAsked {
+                req,
+                fp_hex,
+                switch,
+                listed,
+            } => self.profile_asked(req, fp_hex, switch, listed, &sender),
+            AppMsg::ProfilePicked {
+                req,
+                fp_hex,
+                row,
+                connect,
+            } => self.profile_picked(req, fp_hex, row, connect, &sender),
+            AppMsg::ProfileReasked {
+                req,
+                fp_hex,
+                id,
+                msg,
+                listed,
+            } => self.profile_reasked(req, fp_hex, id, msg, listed, &sender),
+            AppMsg::SeatPolled { stop, row } => self.seat_polled(stop, row, &sender),
+            AppMsg::SeatCancelled(stop) => self.seat_cancelled(&stop),
+            AppMsg::UnlockPrompt {
+                req,
+                fp_hex,
+                row,
+                redial,
+                error,
+            } => self.unlock_prompt(req, fp_hex, row, redial, error, &sender),
+            AppMsg::UnlockReasked {
+                req,
+                fp_hex,
+                id,
+                error,
+                sent,
+                listed,
+            } => self.unlock_reasked(req, fp_hex, id, error, sent, listed, &sender),
+            AppMsg::SendLogs(req, mgmt_port) => self.send_logs(req, mgmt_port, &sender),
+            AppMsg::HostAction {
+                req,
+                mgmt,
+                action_id,
+                label,
+                danger,
+            } => self.host_action(req, mgmt, action_id, label, danger, &sender),
+            AppMsg::SpeedTestDone => self.flights.release_alone(),
+            AppMsg::OpenLibrary(req) => {
+                self.show_view("library");
+                self.library.emit(LibraryMsg::Open(req));
+            }
+            AppMsg::ShowView(name) => self.show_view(name),
+            AppMsg::Find => {
+                self.show_view("library");
+                self.library.emit(LibraryMsg::FocusSearch);
+            }
+            AppMsg::Reload => match self.views.visible_child_name().as_deref() {
+                Some("library") => self.library.emit(LibraryMsg::Reload),
+                _ => self.hosts.emit(HostsMsg::Rescan),
+            },
+            AppMsg::StartSession {
+                req,
+                fp_hex,
+                tofu,
+                opts,
+            } => self.start_session(req, fp_hex, tofu, opts, &sender),
+            AppMsg::SessionReady { req, fp_hex } => self.session_ready(req, fp_hex),
+            AppMsg::SessionExited {
+                req,
+                code,
+                error,
+                ended,
+            } => self.session_exited(req, code, error, ended, &sender),
+            AppMsg::OpenConsole => self.open_console(&sender, false),
+            AppMsg::Pads(n) => {
+                let prev = std::mem::replace(&mut self.pads, n);
+                if !self.flights.any()
+                    && orchestrate::console_opens(self.store.settings().gamepad_ui(), prev, n)
+                {
+                    self.open_console(&sender, true);
+                }
+            }
+            AppMsg::SettingsClosed => self.apply_fullscreen(),
+            AppMsg::ToggleFullscreen => {
+                if self.window.is_fullscreen() {
+                    self.window.unfullscreen();
+                } else {
+                    self.window.fullscreen();
+                }
+            }
+            AppMsg::ConsoleExited(err) => {
+                self.flights.release_alone();
+                // Quitting the console (B at its root) exits 0 and returns here silently.
+                if let Some(e) = err {
+                    self.hosts.emit(HostsMsg::ShowError(e));
+                }
+                self.hosts.emit(HostsMsg::Refresh);
+            }
+            AppMsg::ShowPreferences => sender.input(AppMsg::ShowPreferencesScoped(
+                crate::settings::Scope::Defaults,
+            )),
+            AppMsg::ShowPreferencesScoped(scope) => self.show_preferences(scope, &sender),
+            AppMsg::ShowShortcuts => {
+                shortcuts_dialog(&self.store.settings()).present(Some(&self.window))
+            }
+            AppMsg::ShowAbout => crate::settings::show_about(&self.window),
+            AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
+            AppMsg::Disconnect(key) => {
+                self.flights.terminate(key.as_deref(), DISCONNECT_GRACE);
+                self.show_streams();
+            }
+            AppMsg::Toast(msg) => self.toast(&msg),
+            AppMsg::Hidden(msg, id) => {
+                let toast = plain_toast(&msg);
+                toast.set_button_label(Some(pf_l10n::common::common_undo()));
+                let library = self.library.sender().clone();
+                toast.connect_button_clicked(move |_| {
+                    library.emit(LibraryMsg::SetHidden(id.clone(), false));
+                });
+                self.toasts.add_toast(toast);
+            }
+            AppMsg::AwaitingApproval(req) => {
+                let flight = self.flights.of(&req.card_key());
+                // A request for access already shows it. A dial with an unlock waits for its
+                // desktop to start, which is a progress line, not an approval.
+                if flight.waiting.borrow().is_none() {
+                    if let connect::Slot::Session(child, _) = &flight.slot {
+                        let child = child.clone();
+                        let cancel = move || child.terminate(DISCONNECT_GRACE);
+                        let name = &req.host.name;
+                        match flight.attempt.on_pending() {
+                            Pending::Starting => {
+                                let line = starting_line(name);
+                                gate::present_wait(
+                                    &self.window,
+                                    &flight.waiting,
+                                    &line,
+                                    None,
+                                    cancel,
+                                );
+                            }
+                            Pending::Approval => {
+                                gate::present_waiting(
+                                    &self.window,
+                                    &flight.waiting,
+                                    name,
+                                    &self.identity,
+                                    cancel,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A toast that shows `msg` as written. A toast reads markup unless told not to, and these
+/// carry a host's name, a game's title or a link's text.
+fn plain_toast(msg: &str) -> adw::Toast {
+    let toast = adw::Toast::new(msg);
+    toast.set_use_markup(false);
+    toast
+}
+
+impl AppModel {
+    pub fn toast(&self, msg: &str) {
+        self.toasts.add_toast(plain_toast(msg));
+    }
+
+    /// A destination, over any host page pushed on top of it.
+    fn show_view(&self, name: &str) {
+        self.nav.pop_to_tag("main");
+        self.views.set_visible_child_name(name);
+    }
+
+    /// The rows write through the store as they change, so the pages follow on their own.
+    fn show_preferences(&self, scope: crate::settings::Scope, sender: &ComponentSender<Self>) {
+        let (reopen, closed) = (sender.clone(), sender.clone());
+        crate::settings::show_scoped(
+            &self.window,
+            self.store.clone(),
+            &self.gamepad,
+            &self.probes.borrow(),
+            scope,
+            // A scope change closes the dialog and asks for it back in the new scope.
+            move |next| reopen.input(AppMsg::ShowPreferencesScoped(next)),
+            move || closed.input(AppMsg::SettingsClosed),
+        );
+    }
+
+    /// Fullscreen Always: on enters fullscreen, off leaves only a fullscreen it entered.
+    fn apply_fullscreen(&mut self) {
+        let always = self.store.settings().fullscreen_always();
+        if always && !self.window.is_fullscreen() {
+            self.window.fullscreen();
+            self.fullscreen_by_setting = true;
+        } else if !always && std::mem::take(&mut self.fullscreen_by_setting) {
+            self.window.unfullscreen();
+        }
+    }
+}
+
+thread_local! {
+    /// Where a delivered URL goes once the window exists. Both ends of this live on the GTK
+    /// main thread: `connect_open` fires there, and so does the model's `init`.
+    static LINK_TX: std::cell::RefCell<Option<relm4::Sender<AppMsg>>> =
+        const { std::cell::RefCell::new(None) };
+    /// URLs that arrived before the model existed — the cold-start case, where GApplication
+    /// runs `open` before `activate` builds the window. A dropped URL is the one outcome a
+    /// link must never have, so they wait here instead.
+    static PENDING_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand a URL to the running app, or park it until there is one.
+fn deliver_deep_link(url: String) {
+    let queued = LINK_TX.with_borrow(|tx| match tx {
+        Some(tx) => {
+            let _ = tx.send(AppMsg::DeepLink(url.clone()));
+            false
+        }
+        None => true,
+    });
+    if queued {
+        PENDING_LINKS.with_borrow_mut(|q| q.push(url));
+    }
+}
+
+/// The crate's one runtime env mutation, isolated so `main.rs`'s `deny(unsafe_code)` covers
+/// everything else and the exemption is a named function rather than a whole call site.
+#[allow(unsafe_code)]
+fn clear_steam_sdl_device_filter() {
+    for var in [
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
+            // SAFETY: called at the top of `run()`, before GTK init or any other thread
+            // exists in this process — nothing reads the environment concurrently.
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+}
+
+/// Reads the OS's languages into `pf_l10n`. GTK and libadwaita translate their own strings
+/// through gettext; while Punktfunk reads English, their messages stay English too, so one
+/// window never mixes two languages. Every other locale category follows the OS. Call before
+/// GTK starts and before any other thread exists.
+#[allow(unsafe_code)]
+fn set_language() {
+    // Another language leaves GTK on the OS's list; matching it needs `LANGUAGE` narrowed.
+    if pf_l10n::set_languages(&pf_l10n::os_languages()) != "en" {
+        return;
+    }
+    gtk::disable_setlocale();
+    // gettext ignores `LANGUAGE` while messages are in the C locale.
+    // SAFETY: GTK has not started and no other thread exists, so nothing reads the locale
+    // while it changes. Both arguments are NUL-terminated literals.
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+        libc::setlocale(libc::LC_MESSAGES, c"C".as_ptr());
+    }
+}
+
+pub fn run() -> glib::ExitCode {
+    // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
+    // joins the ring too, so a bundle carries the stream's trail. Colour only on a terminal.
+    pf_client_core::logring::init_tracing(
+        std::io::stdout,
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    );
+    // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
+    // physical pad Steam Input has virtualized; the Settings controller list needs the
+    // real devices (same rationale as the session binary).
+    clear_steam_sdl_device_filter();
+    // Headless paths (no GTK window). Pairing, wake, host listing and reset live in the
+    // `punktfunk` CLI, which ships in the same package.
+    if let Some(target) = crate::cli::arg_value("--library") {
+        return crate::cli::headless_library(&target);
+    }
+    // Headless known-hosts management (list/add/edit/forget/reset) + reachability probes —
+    // the shared store the Decky plugin drives; returns None when argv names none of them.
+    if let Some(code) = crate::cli::headless_host_command() {
+        return code;
+    }
+    // Streams and the console library live in the session binary now — exec it,
+    // forwarding the relevant argv (the Decky wrapper keeps working through the shell
+    // until it's repointed).
+    // `--browse` may be bare now (the console home — hosts, pairing, settings), so the
+    // gate is the flag, not a value after it.
+    if crate::cli::arg_value("--connect").is_some()
+        || crate::cli::arg_flag("--browse")
+        || crate::cli::couch_launch()
+    {
+        return crate::cli::exec_session();
+    }
+    set_language();
+
+    // HANDLES_OPEN is what makes `Exec=punktfunk-client %u` work: GApplication turns the URI
+    // into an `open` call, and — this is the part that matters — a SECOND invocation forwards
+    // its URI to the already-running instance over D-Bus and exits, so clicking a link with
+    // Punktfunk open reuses the window instead of racing a new one.
+    let mut builder = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN);
+    // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps
+    // each launch its own primary instance.
+    if crate::shots::shot_scene().is_some() {
+        builder =
+            builder.flags(gio::ApplicationFlags::NON_UNIQUE | gio::ApplicationFlags::HANDLES_OPEN);
+    }
+    let adw_app = builder.build();
+    adw_app.connect_open(|app, files, _hint| {
+        for f in files {
+            deliver_deep_link(f.uri().to_string());
+        }
+        // `open` does not raise a window on its own; the model's activate handler does.
+        app.activate();
+    });
+    // One SDL context for the whole process, started while single-threaded.
+    let gamepad = crate::gamepad::GamepadService::start();
+    // argv stays withheld from GApplication — except for a positional URL, which is exactly
+    // what GIO's single-instance forwarding is for. Passing it through means the FIRST
+    // instance's `open` fires locally and a later one's is delivered to the primary, with no
+    // IPC of our own.
+    let args: Vec<String> = match crate::cli::deep_link_arg() {
+        Some(url) => vec![
+            std::env::args()
+                .next()
+                .unwrap_or_else(|| "punktfunk-client".into()),
+            url,
+        ],
+        None => Vec::new(),
+    };
+    let app = relm4::RelmApp::from_app(adw_app).with_args(args);
+    // relm4 ends `run` on a blocking main-context iteration, after GApplication has drained every
+    // ready source. An instance that only forwards to the running one would never wake from it,
+    // so the idle, which that drain dispatches, leaves a timer for the iteration.
+    glib::idle_add_once(|| {
+        glib::timeout_add_once(std::time::Duration::from_millis(50), || {});
+    });
+    app.run::<AppModel>(AppInit { gamepad });
+    glib::ExitCode::SUCCESS
+}
+
+/// Register the embedded gresource (built by build.rs from `data/`: the stylesheet and the
+/// OS and launcher marks) and point the icon theme at it, so the `pf-os-*-symbolic` marks
+/// resolve — and recolour — like any themed icon.
+fn install_resources() {
+    if let Err(e) = gio::resources_register_include!("punktfunk-client.gresource") {
+        tracing::warn!(error = %e, "gresource did not register — no stylesheet, no OS marks");
+        return;
+    }
+    if let Some(display) = gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path("/io/unom/punktfunk/icons");
+    }
+}
+
+fn load_css() {
+    let provider = gtk::CssProvider::new();
+    // Registered with the icons just before.
+    provider.load_from_resource("/io/unom/punktfunk/style.css");
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+/// Window actions behind the hosts page's header (the primary menu + "+") — thin
+/// forwards into the message loop.
+fn install_actions(window: &adw::ApplicationWindow, sender: &ComponentSender<AppModel>) {
+    let add = |name: &str, msg: fn() -> AppMsg| {
+        let action = gio::SimpleAction::new(name, None);
+        let sender = sender.clone();
+        action.connect_activate(move |_, _| sender.input(msg()));
+        action
+    };
+    window.add_action(&add("preferences", || AppMsg::ShowPreferences));
+    window.add_action(&add("shortcuts", || AppMsg::ShowShortcuts));
+    window.add_action(&add("about", || AppMsg::ShowAbout));
+    window.add_action(&add("add-host", || AppMsg::ShowAddHost));
+    window.add_action(&add("console", || AppMsg::OpenConsole));
+    window.add_action(&add("fullscreen", || AppMsg::ToggleFullscreen));
+    window.add_action(&add("show-hosts", || AppMsg::ShowView("hosts")));
+    window.add_action(&add("show-library", || AppMsg::ShowView("library")));
+    window.add_action(&add("find", || AppMsg::Find));
+    window.add_action(&add("reload", || AppMsg::Reload));
+    let app = relm4::main_application();
+    for (_, action, accels) in ACCELS {
+        app.set_accels_for_action(action, accels);
+    }
+}
+
+/// A window key: what it does, the action it triggers, its accelerators.
+type Accel = (fn() -> &'static str, &'static str, &'static [&'static str]);
+
+/// The window's keys, as the shortcuts dialog lists them.
+const ACCELS: &[Accel] = &[
+    (
+        desktop::desktop_accel_show_hosts,
+        "win.show-hosts",
+        &["<Control>1"],
+    ),
+    (
+        desktop::desktop_accel_show_library,
+        "win.show-library",
+        &["<Control>2"],
+    ),
+    (
+        desktop::desktop_accel_search_library,
+        "win.find",
+        &["<Control>f"],
+    ),
+    (
+        desktop::desktop_accel_add_host,
+        "win.add-host",
+        &["<Control>n"],
+    ),
+    (
+        desktop::desktop_accel_reload,
+        "win.reload",
+        &["<Control>r", "F5"],
+    ),
+    (
+        desktop::desktop_accel_preferences,
+        "win.preferences",
+        &["<Control>comma"],
+    ),
+    (
+        desktop::desktop_accel_shortcuts,
+        "win.shortcuts",
+        &["<Control>question"],
+    ),
+    (
+        desktop::desktop_accel_fullscreen,
+        "win.fullscreen",
+        &["F11"],
+    ),
+    (
+        desktop::desktop_accel_close_window,
+        "window.close",
+        &["<Control>w", "<Control>q"],
+    ),
+];
+
+/// The `Settings::extra` key the window's size is kept under: width, height, maximized.
+const WINDOW_KEY: &str = pf_client_core::settings::SHELL_WINDOW_KEY;
+
+/// Open at the size the window last closed at, and keep it on close.
+fn remember_size(window: &adw::ApplicationWindow, store: &Rc<Store>) {
+    let kept: Vec<i64> = store
+        .settings()
+        .extra
+        .get(WINDOW_KEY)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|n| n.as_i64()).collect())
+        .unwrap_or_default();
+    if let [w, h, maximized] = kept[..] {
+        window.set_default_size(w.clamp(360, 8192) as i32, h.clamp(294, 8192) as i32);
+        window.set_maximized(maximized != 0);
+    }
+    let store = store.clone();
+    window.connect_close_request(move |w| {
+        let (width, height) = w.default_size();
+        let size = vec![
+            i64::from(width),
+            i64::from(height),
+            i64::from(w.is_maximized()),
+        ];
+        store.update_settings(|s| s.extra.insert(WINDOW_KEY.into(), size.into()));
+        glib::Propagation::Proceed
+    });
+}
+
+/// One banner under each destination's header, kept in step.
+#[derive(Clone)]
+struct Banners(Vec<adw::Banner>);
+
+impl Banners {
+    fn new(pages: &[adw::ToolbarView], on_button: impl Fn() + Clone + 'static) -> Banners {
+        Banners(
+            pages
+                .iter()
+                .map(|page| {
+                    let banner = adw::Banner::new("");
+                    let on_button = on_button.clone();
+                    banner.connect_button_clicked(move |_| on_button());
+                    page.add_top_bar(&banner);
+                    banner
+                })
+                .collect(),
+        )
+    }
+
+    fn show(&self, title: &str, button: Option<&str>) {
+        for b in &self.0 {
+            b.set_title(title);
+            b.set_button_label(button);
+            b.set_revealed(true);
+        }
+    }
+
+    fn hide(&self) {
+        for b in &self.0 {
+            b.set_revealed(false);
+        }
+    }
+}
+
+/// "Your changes aren't being saved", while the last write to the config dir failed.
+fn store_health_banner(pages: &[adw::ToolbarView], store: &Store) {
+    let banners = Banners::new(pages, || {});
+    let check = move || match pf_client_core::trust::store_health::last_error() {
+        Some(_) => banners.show(desktop::desktop_store_unsaved_body(), None),
+        None => banners.hide(),
+    };
+    check();
+    store.subscribe(move |_| check());
+}
+
+/// The Keyboard Shortcuts dialog: this window's keys, then the stream's shortcuts as `s`
+/// binds them, each chord as text since the player may have moved it anywhere.
+pub fn shortcuts_dialog(s: &crate::trust::Settings) -> adw::ShortcutsDialog {
+    let dialog = adw::ShortcutsDialog::new();
+    for section in shortcut_sections(s) {
+        dialog.add(section);
+    }
+    dialog
+}
+
+fn shortcut_sections(s: &crate::trust::Settings) -> Vec<adw::ShortcutsSection> {
+    use pf_client_core::overlay_actions::{OverlayConfig, RingPlatform};
+    use pf_client_core::shortcuts::{Client, Kind};
+    let shell = adw::ShortcutsSection::new(Some(desktop::desktop_shortcuts_this_window()));
+    for (title, action, _) in ACCELS {
+        shell.add(adw::ShortcutsItem::from_action(title(), action));
+    }
+    let mut sections = vec![shell];
+    let stream = crate::settings::shortcuts::live(&s.shortcuts, &s.guide_gesture);
+    let ring = OverlayConfig::parse(&s.overlay_actions, RingPlatform::Desktop);
+    for g in stream.rows_in(&ring, Client::Desktop, true) {
+        let title = match g.kind {
+            Kind::Keyboard => desktop::desktop_shortcuts_stream_window().into(),
+            _ => g.heading(),
+        };
+        let section = adw::ShortcutsSection::new(Some(&title));
+        for i in g.items {
+            let item = adw::ShortcutsItem::new(&i.text(), "");
+            item.set_subtitle(&i.keys.to_string());
+            section.add(item);
+        }
+        sections.push(section);
+    }
+    sections
+}
+
+#[cfg(test)]
+mod shortcuts_tests {
+    /// Every section of the dialog holds items, and the controller chords are in it.
+    /// Needs a display and its own process:
+    /// `cargo test -p punktfunk-client-linux -- --ignored shortcuts_dialog_lists`.
+    #[test]
+    #[ignore = "needs a Wayland/X display"]
+    fn shortcuts_dialog_lists_the_controller_chords() {
+        use adw::prelude::*;
+        assert!(gtk::init().is_ok() && adw::init().is_ok(), "no display");
+        let s = crate::trust::Settings::default();
+        let _ = super::shortcuts_dialog(&s);
+        let mut found = false;
+        for section in super::shortcut_sections(&s) {
+            assert!(section.n_items() > 0, "{:?} is empty", section.title());
+            for i in 0..section.n_items() {
+                let item = section
+                    .item(i)
+                    .and_downcast::<adw::ShortcutsItem>()
+                    .unwrap();
+                found |= item.subtitle() == "Select + A";
+            }
+        }
+        assert!(found, "no Select + A row");
+    }
+}

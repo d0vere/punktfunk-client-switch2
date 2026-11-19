@@ -1,0 +1,139 @@
+---
+title: Clients
+description: The Punktfunk apps for Apple devices, Linux, Windows, Android and LG TVs, the browser client, the Samsung TV app, Moonlight, and the punktfunk command — what each does and which to pick.
+---
+
+Pick the app for the device you stream *to*. Install steps for each are on
+[Install a Client](/docs/install-client).
+
+## Which should I use?
+
+| You're streaming to… | Use |
+|---|---|
+| A Mac, iPhone, iPad, Apple TV or Apple Vision Pro | The [Apple app](#apple-app-mac-iphone-ipad-apple-tv-vision-pro) |
+| A Linux desktop or laptop | The [Linux app](#linux-desktop-client-gtk4) |
+| A Steam Deck | The [Decky plugin](/docs/steam-deck) in Gaming Mode, the Linux app in Desktop Mode |
+| A Windows PC | The [Windows app](#windows-desktop-client) |
+| An Android phone, tablet or TV | The [Android app](#android-app-phone--android-tv) |
+| An LG webOS TV | The [webOS app](#webos-app-lg-tv) |
+| A Samsung TV | The [Samsung TV app](/docs/samsung-tv) (preview) |
+| A browser tab, with nothing to install | The [browser client](/docs/browser-client) (preview) |
+| Any other device | [Moonlight](#moonlight-anything-else) |
+| Scripts and home automation | The [`punktfunk` command](#scripting-the-punktfunk-cli) |
+
+Every Punktfunk app [pairs](/docs/pairing) once and reconnects on its own, browses the host's
+[game library](/docs/game-library), and has a controller interface for the couch. All but the
+Samsung TV app find hosts on your network by themselves. They share
+[presets and `punktfunk://` links](/docs/presets-and-links), the
+[in-stream keys](/docs/shortcuts#getting-your-input-back) and the settings on
+[Client settings](/docs/client-settings). The Apple, Android, Linux and Windows apps also ask which
+[profile](/docs/profiles#how-players-pick) plays.
+
+## Apple app (Mac, iPhone, iPad, Apple TV, Vision Pro)
+
+One app for macOS, iOS, iPadOS, tvOS and visionOS. It adds:
+
+- A **Library** tab (a sidebar row on the Mac) with a chip for each host.
+- A host page behind each card's ⓘ, with presets, pairing, power and a network speed test. On
+  Apple TV, hold the card or press Play/Pause on it.
+- Widgets for hosts and the game library, a Live Activity while you stream, and Shortcuts actions
+  for Siri.
+- DualSense rumble, adaptive triggers, lightbar, motion and touchpad.
+- On a foldable iPhone, a stream that follows the fold: the cover screen, the inner screen, and the
+  upright half when it sits half open like a laptop
+  ([foldable iPhone](/docs/input#foldable-iphone)).
+
+## Linux desktop client (GTK4)
+
+`punktfunk-client` is a GTK4 app with hardware decode (Vulkan Video or VAAPI, or V4L2
+[on ARM](/docs/linux-arm)), PipeWire audio and SDL3 controllers. It adds:
+
+- **Hosts** and **Library** tabs, at the bottom of a narrow window. The Library has a chip for each
+  paired host and pinned preset, and sections you arrange with **Customize**.
+- A host page behind each card's ⓘ: name, address, port, Wake-on-LAN MAC, presets, pairing, power
+  and a network speed test.
+- Streams from several hosts at once, each in its own window: connect to the next host from the
+  same app. A controller follows the window you're in.
+- A banner while you stream, with **Disconnect**. With several streams it offers **Disconnect
+  all**, and a card's menu ends that host's stream.
+- Keys for the window: **Keyboard shortcuts** in the menu lists them.
+
+For the couch, open **Punktfunk Console**, the gamepad button in the header bar, or run
+`punktfunk-client --browse --fullscreen`. **Controller interface** opens it when a controller
+connects.
+
+## Windows desktop client
+
+A WinUI 3 app for x64 and Arm64 with hardware decode (Vulkan Video or D3D11VA), HDR, WASAPI audio
+and SDL3 controllers. It adds:
+
+- **Hosts** and **Library** in a pane on the left, which narrows to icons in a small window. The
+  Library has a chip for each paired host and pinned preset, a search box in the title bar, and
+  sections you arrange with **Customize**.
+- A host page behind each card's ⓘ: name, address, port, Wake-on-LAN MAC, presets, pairing, power
+  and a network speed test.
+- Keys for the window: **Keyboard shortcuts** in the pane lists them.
+
+**Punktfunk Console** in the Start menu is the controller interface for a TV or HTPC, on x64; the
+Arm64 build has no console yet. **Controller interface** opens it when a controller connects.
+
+## Android app (phone + Android TV)
+
+One app for phones, tablets and Android TV, with hardware decode, [HDR10](/docs/hdr#per-client), a
+microphone uplink and D-pad navigation.
+
+Plug a **DualSense**, **DualSense Edge** or **DualShock 4** in by **USB** and allow the USB prompt:
+the host then gets rumble, adaptive triggers, the lightbar and gyro. Over Bluetooth the pad works as
+an ordinary gamepad. **Settings → Controllers → DualSense over USB** turns this off.
+
+On a handheld with a second, smaller screen below the first (an Ayn Thor, a Retroid Pocket with the
+Dual Screen add-on) or a foldable half-opened like a laptop, the stream takes the top screen and
+the lower one shows a panel of controls
+([dual-screen handhelds](/docs/input#dual-screen-handhelds)). **Settings → Display → Second
+screen** turns it off. If the lower screen stays dark while you stream, end the stream and
+[send your logs](/docs/report-an-issue).
+
+## webOS app (LG TV)
+
+[client-webos](https://github.com/punktfunk/client-webos) is the Punktfunk app for LG TVs on webOS 5
+or newer. It uses the TV's hardware decoder and works with the Magic Remote. It isn't in the LG
+Content Store: [install it from the Homebrew Channel](/docs/install-client#lg-webos-tv-community).
+
+## Moonlight (anything else)
+
+Any [Moonlight](https://moonlight-stream.org/) client connects over GameStream once the host turns
+it on: see [Connect with Moonlight](/docs/moonlight). The stream is encrypted and adapts to a lossy
+link; the native speed test and jumbo frames are Punktfunk-app only.
+
+## Scripting: the `punktfunk` CLI
+
+`punktfunk` is the client without a window. It ships with every Linux package and the Windows
+installer. Under the Flatpak, run it as `flatpak run --command=punktfunk io.unom.punktfunk`.
+
+```sh
+punktfunk discover                            # hosts advertising on this network
+punktfunk pair <host>[:port] --pin -          # pair this device; PIN on stdin
+punktfunk hosts list --probe                  # saved hosts, each checked live
+punktfunk library <host-ref> --json           # the host's games
+punktfunk launch <host-ref> --game <id>       # stream, waking the host first
+punktfunk profiles <host-ref>                 # who plays on the host; --pick saves one
+punktfunk launch <host-ref> --as <profile>    # stream as that profile, this time only
+punktfunk end-game <host-ref> --game <id>     # close a game this device launched
+punktfunk open 'punktfunk://connect/<host-ref>'
+punktfunk speed-test <host-ref>               # what the link carries, loss at a rate it holds
+punktfunk network-check <host-ref>            # the speed test plus what the link does, by finding
+```
+
+A `<host-ref>` is a saved host's id, its name or its address. Also: `hosts add`, `hosts forget`,
+`default-host`, [`wake`](/docs/wake-on-lan#from-the-command-line), `reachable`, `presets list`,
+`device-code` and `reset`. `punktfunk help <command>` lists a command's flags.
+
+- `pair` reads the PIN from stdin with `--pin -`, or asks for it on a terminal. A PIN on the command
+  line is refused.
+- `open` asks before connecting unless the link names the host by its id. `--yes` answers for you;
+  with no terminal and no `--yes` it exits 6.
+- Exit codes: **0** ok, **2** connect failed, **3** trust rejected (pair again), **4** the renderer
+  didn't start, **5** nothing matched, **6** needs a person (pairing or an unknown host).
+
+Older scripts can keep `punktfunk-client --connect <host>:9777`; on Windows, `--discover` and
+`--headless --speed-test` too. They don't wake a sleeping host.

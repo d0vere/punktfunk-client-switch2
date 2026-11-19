@@ -1,0 +1,6 @@
+│
+◆  For paddles, trackpads and gyro; the punktfunk group can attach USB devices, so only on a host
+│  you trust.
+│  ● Yes
+│  ○ No
+│

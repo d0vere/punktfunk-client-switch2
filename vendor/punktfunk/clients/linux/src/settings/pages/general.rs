@@ -1,0 +1,322 @@
+//! General: the session, the console, Omarchy, the statistics overlay, Show advanced, and
+//! the reset that ends the page.
+
+use super::{Build, PageB};
+use crate::settings::choice::set_row_subtitle;
+use crate::settings::field::Field;
+use crate::settings::presets::NextScope;
+use crate::settings::spec::{self, Page};
+use crate::settings::tables::{at, index};
+use crate::settings::Scope;
+use crate::store::Store;
+use crate::trust::Settings;
+use adw::prelude::*;
+use pf_client_core::settings::GamepadUi;
+use pf_client_core::start::{self, StartIn};
+use pf_client_core::trust::{HudCorner, StatsVerbosity};
+use pf_l10n::{client, common, desktop};
+use punktfunk_core::hud::STATS_SCALE_PCTS;
+use std::rc::Rc;
+
+pub fn general(b: &mut Build, switcher: adw::PreferencesGroup, next: &NextScope) {
+    let mut p = b.page(Page::General, "preferences-system-symbolic");
+    // The scope switcher heads the first page: it is about which layer you edit.
+    p.page.add(&switcher);
+    session(b, &mut p);
+    if cfg!(feature = "console") {
+        console(b, &mut p);
+    }
+    // Only where the theme exists, rather than sitting disabled.
+    if pf_client_core::omarchy::present() {
+        omarchy(b, &mut p);
+    }
+
+    let stats = p.group(client::prefs_group_statistics(), "");
+    let tiers: Vec<&str> = StatsVerbosity::ALL.iter().map(|v| v.label()).collect();
+    let row = b.choice(&spec::STATS, &tiers);
+    b.put(
+        &mut p,
+        Some(&stats),
+        Field::choice(&spec::STATS, &row, index::stats, |s, i| {
+            s.set_stats_verbosity(*at(&StatsVerbosity::ALL, i))
+        }),
+    );
+    p.row(&stats, &docs_row());
+
+    let advanced = p.group("", "");
+    let (field, show) = Field::switch(
+        &spec::SHOW_ADVANCED,
+        |s| s.show_advanced,
+        |s, v| s.show_advanced = v,
+    );
+    b.put(&mut p, Some(&advanced), field);
+    b.show_advanced = Some(show);
+
+    let (field, _) = Field::switch(
+        &spec::ADVANCED_STATS,
+        |s| s.advanced_stats,
+        |s, v| s.advanced_stats = v,
+    );
+    b.put(&mut p, None, field);
+    let corners: Vec<&str> = HudCorner::ALL.iter().map(|c| c.label()).collect();
+    let row = b.choice(&spec::STATS_POSITION, &corners);
+    b.put(
+        &mut p,
+        None,
+        Field::choice(
+            &spec::STATS_POSITION,
+            &row,
+            index::stats_position,
+            |s, i| s.hud_placement = at(&HudCorner::ALL, i).as_name().to_string(),
+        ),
+    );
+    let sizes: Vec<String> = STATS_SCALE_PCTS
+        .iter()
+        .map(common::common_percent)
+        .collect();
+    let row = b.choice(
+        &spec::STATS_SIZE,
+        &sizes.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    b.put(
+        &mut p,
+        None,
+        Field::choice(&spec::STATS_SIZE, &row, index::stats_size, |s, i| {
+            s.stats_scale_pct = *at(&STATS_SCALE_PCTS, i)
+        }),
+    );
+    let (field, _) = Field::switch(&spec::EXIT_HINT, |s| s.exit_hint, |s, v| s.exit_hint = v);
+    b.put(&mut p, None, field);
+    if !b.preset_scope {
+        p.advanced_row(&clear_art_row(&b.dialog));
+    }
+    let page = p.page.clone();
+    b.finish(p);
+    if !b.preset_scope {
+        page.add(&reset_group(&b.dialog, b.store, next));
+    }
+}
+
+/// The page's last group: every setting back to a fresh install's value, asked first. The
+/// dialog then opens again on the defaults, so each row shows them.
+fn reset_group(
+    dialog: &adw::PreferencesDialog,
+    store: &Rc<Store>,
+    next: &NextScope,
+) -> adw::PreferencesGroup {
+    let row = adw::ButtonRow::builder()
+        .title(client::prefs_reset_all())
+        .build();
+    row.add_css_class("destructive-action");
+    let (weak, store, next) = (dialog.downgrade(), store.clone(), next.clone());
+    row.connect_activated(move |_| {
+        let Some(dialog) = weak.upgrade() else { return };
+        let confirm = adw::AlertDialog::new(
+            Some(client::prefs_reset_all_title()),
+            Some(client::prefs_reset_all_body()),
+        );
+        confirm.add_responses(&[
+            ("cancel", common::common_cancel()),
+            ("reset", common::common_reset()),
+        ]);
+        confirm.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+        confirm.set_default_response(Some("cancel"));
+        confirm.set_close_response("cancel");
+        let (store, next, d) = (store.clone(), next.clone(), dialog.clone());
+        confirm.connect_response(Some("reset"), move |_, _| {
+            store.update_settings(Settings::reset_to_defaults);
+            *next.borrow_mut() = Some(Scope::Defaults);
+            d.close();
+        });
+        confirm.present(Some(&dialog));
+    });
+    let group = adw::PreferencesGroup::new();
+    group.add(&row);
+    group
+}
+
+fn session(b: &mut Build, p: &mut PageB) {
+    let g = p.group(client::prefs_group_session(), "");
+    // A preset carries only `fullscreen_on_stream`; the defaults show the three-way picker,
+    // which also sets `fullscreen_always`.
+    let (field, _) = Field::switch(
+        &spec::FULLSCREEN_ON_STREAM,
+        |s| s.fullscreen_on_stream,
+        |s, v| s.fullscreen_on_stream = v,
+    );
+    b.put(p, Some(&g), field);
+    let row = b.choice(
+        &spec::FULLSCREEN,
+        &[
+            client::player_fullscreen_off(),
+            client::player_fullscreen_stream(),
+            client::player_fullscreen_always(),
+        ],
+    );
+    b.put(
+        p,
+        Some(&g),
+        Field::choice(
+            &spec::FULLSCREEN,
+            &row,
+            |s| {
+                if s.fullscreen_always() {
+                    2
+                } else {
+                    u32::from(s.fullscreen_on_stream)
+                }
+            },
+            |s, i| {
+                s.fullscreen_on_stream = i >= 1;
+                s.set_fullscreen_always(i == 2);
+            },
+        ),
+    );
+    let (field, _) = Field::switch(&spec::AUTO_WAKE, |s| s.auto_wake, |s, v| s.auto_wake = v);
+    b.put(p, Some(&g), field);
+    let row = b.choice(&spec::START_IN, &StartIn::ALL.map(StartIn::label));
+    set_row_subtitle(row.widget(), &start_in_subtitle(b.store));
+    b.put(
+        p,
+        Some(&g),
+        Field::choice(
+            &spec::START_IN,
+            &row,
+            |s| {
+                let want = StartIn::parse(&s.start_in);
+                StartIn::ALL.iter().position(|v| *v == want).unwrap_or(1) as u32
+            },
+            |s, i| s.start_in = at(&StartIn::ALL, i).as_str().to_string(),
+        ),
+    );
+}
+
+/// Which interface this device opens: the device's, never a preset's.
+fn console(b: &mut Build, p: &mut PageB) {
+    let g = p.group(client::prefs_group_console(), "");
+    let (field, on) = Field::switch(
+        &spec::GAMEPAD_UI,
+        |s| s.gamepad_ui() != GamepadUi::Off,
+        |s, v| s.set_gamepad_ui_enabled(v),
+    );
+    b.put(p, Some(&g), field);
+    let mode = b.choice(
+        &spec::GAMEPAD_UI_MODE,
+        &[
+            client::player_gamepad_ui_mode_connected(),
+            client::player_gamepad_ui_mode_always(),
+        ],
+    );
+    let w = mode.widget().clone();
+    w.set_visible(false);
+    on.connect_active_notify(move |r| w.set_visible(r.is_active()));
+    b.put(
+        p,
+        Some(&g),
+        Field::choice(
+            &spec::GAMEPAD_UI_MODE,
+            &mode,
+            |s| u32::from(s.gamepad_ui_always()),
+            |s, i| s.set_gamepad_ui_always(i == 1),
+        ),
+    );
+}
+
+fn omarchy(b: &mut Build, p: &mut PageB) {
+    let g = p.group("Omarchy", "");
+    let (field, _) = Field::switch(
+        &spec::FOLLOW_OS_THEME,
+        |s| s.follow_os_theme,
+        |s, v| {
+            s.follow_os_theme = v;
+            // Live: the switch must not wait out the shell's 2 s poll.
+            crate::desktop::omarchy::set_enabled(v);
+        },
+    );
+    b.put(p, Some(&g), field);
+    b.put(p, Some(&g), omarchy_menu());
+}
+
+/// Not a setting: the block's presence in the user's omarchy-menu.jsonc is the state, so two
+/// installs cannot disagree with it.
+fn omarchy_menu() -> Field {
+    use pf_client_core::omarchy_menu as menu;
+    let row = adw::SwitchRow::builder()
+        .title(spec::OMARCHY_MENU.title())
+        .subtitle(spec::OMARCHY_MENU.caption())
+        .build();
+    let r = row.clone();
+    Field::new(
+        &spec::OMARCHY_MENU,
+        &row,
+        vec![row.clone().upcast()],
+        {
+            let r = r.clone();
+            move |_| r.set_active(menu::enabled())
+        },
+        {
+            let r = r.clone();
+            move |_| {
+                let res = match (r.is_active(), menu::enabled()) {
+                    (true, false) => menu::enable(),
+                    (false, true) => menu::disable(),
+                    _ => Ok(()),
+                };
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "omarchy menu not written");
+                }
+            }
+        },
+        || false,
+        move |f| {
+            r.connect_active_notify(move |_| f());
+        },
+    )
+}
+
+/// Names the host Start in resolves to, and says when it resolves to nothing, which is what
+/// every value does until a host is paired.
+fn start_in_subtitle(store: &Store) -> String {
+    let known = store.hosts();
+    match start::default_host(&store.settings(), &known) {
+        Some(i) => client::player_start_in_host_hint(&known.hosts[i].name),
+        None => client::player_start_in_no_host_hint().into(),
+    }
+}
+
+fn docs_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(client::player_stats_docs_link())
+        .subtitle("docs.punktfunk.unom.io/docs/stats")
+        .activatable(true)
+        .build();
+    row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
+    row.connect_activated(|_| {
+        gtk::UriLauncher::new("https://docs.punktfunk.unom.io/docs/stats").launch(
+            None::<&gtk::Window>,
+            gtk::gio::Cancellable::NONE,
+            |_| {},
+        );
+    });
+    row
+}
+
+fn clear_art_row(dialog: &adw::PreferencesDialog) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(desktop::desktop_clear_art())
+        .subtitle(desktop::desktop_clear_art_hint())
+        .activatable(true)
+        .build();
+    row.add_suffix(&crate::widgets::lucide::row_icon("trash-2"));
+    let dialog = dialog.downgrade();
+    row.connect_activated(move |_| {
+        let toast = match pf_client_core::art_cache::clear() {
+            Ok(()) => desktop::desktop_clear_art_done().to_string(),
+            Err(e) => desktop::desktop_clear_art_failed(e),
+        };
+        if let Some(d) = dialog.upgrade() {
+            d.add_toast(adw::Toast::new(&toast));
+        }
+    });
+    row
+}

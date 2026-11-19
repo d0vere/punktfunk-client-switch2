@@ -1,0 +1,434 @@
+//! Session⇄game lifetime settings (`<config>/session-settings.json`).
+//!
+//! Two operator choices (`design/session-game-lifetime.md`):
+//!
+//! * [`SessionSettings::session_on_game_exit`] — end the session when the
+//!   launched game exits. **On** by default.
+//! * [`SessionSettings::game_on_session_end`] — end the launched game when the
+//!   session ends. **Off** by default ([`GameOnSessionEnd::Keep`]): ending a
+//!   game can cost unsaved progress. `Always` waits
+//!   [`SessionSettings::disconnect_grace_seconds`] so a blip never costs a save.
+//!
+//! Its own store, not a display-policy axis: keep-alive is how long a *display*
+//! survives a disconnect (off by default); this is a *game* (default 5 minutes).
+//!
+//! Same shape as `DisplayPolicyStore` / `pf_gpu::GpuPrefStore`: missing or
+//! corrupt means unconfigured with a warning (never fail host startup), writes
+//! are private-dir + temp + atomic rename, and memory changes only after the
+//! write lands.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use utoipa::ToSchema;
+
+/// What to do with the launched game when its session ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GameOnSessionEnd {
+    /// Default: nothing is killed unless the operator asks.
+    #[default]
+    Keep,
+    /// End it when the client stops the session deliberately; leave it running if
+    /// the client vanished, so a drop stays reconnectable.
+    OnQuit,
+    /// End it whenever the session ends. A deliberate stop ends it at once; a drop
+    /// starts the reconnect window and ends it only if nobody comes back.
+    Always,
+}
+
+impl GameOnSessionEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::OnQuit => "on_quit",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// What to do with a title this client already has running when it launches a
+/// **different** one.
+///
+/// A third axis, not a fourth [`GameOnSessionEnd`] value: that one is "this
+/// session is over"; this one is "the player asked for something else". An
+/// operator who wants a game to survive a disconnect can still want it closed
+/// when they pick another title.
+///
+/// Scoped to this client's own launches, and only launches this host performed
+/// ([`crate::launchreg`]). A game the player started at the machine was never
+/// recorded, so this cannot close it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GameOnNewLaunch {
+    /// Same posture as [`GameOnSessionEnd::Keep`]: ending a game can cost unsaved progress.
+    #[default]
+    Keep,
+    /// Close it, politely first (`WM_CLOSE` / `SIGTERM`), before starting the new title.
+    End,
+}
+
+/// Default reconnect window before `Always` ends a game. 300 s covers a Wi-Fi
+/// roam or a client restart; being wrong costs unsaved progress.
+const DEFAULT_GRACE_SECS: u32 = 300;
+/// Floor keeps a typed `1` from making `Always` an instant kill; ceiling (24 h)
+/// keeps a stray large value from pinning a lease forever.
+const MIN_GRACE_SECS: u32 = 10;
+const MAX_GRACE_SECS: u32 = 86_400;
+
+fn default_grace() -> u32 {
+    DEFAULT_GRACE_SECS
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct SessionSettings {
+    #[serde(default = "one")]
+    pub version: u32,
+    #[serde(default)]
+    pub game_on_session_end: GameOnSessionEnd,
+    #[serde(default = "default_true")]
+    pub session_on_game_exit: bool,
+    #[serde(default)]
+    pub game_on_new_launch: GameOnNewLaunch,
+    /// Ignored unless `game_on_session_end` is `Always`.
+    #[serde(default = "default_grace")]
+    pub disconnect_grace_seconds: u32,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            game_on_session_end: GameOnSessionEnd::default(),
+            session_on_game_exit: true,
+            game_on_new_launch: GameOnNewLaunch::default(),
+            disconnect_grace_seconds: DEFAULT_GRACE_SECS,
+        }
+    }
+}
+
+impl SessionSettings {
+    /// Clamp anything a hand-edited file or plugin could get wrong.
+    pub fn sanitized(mut self) -> Self {
+        self.version = 1;
+        self.disconnect_grace_seconds = self
+            .disconnect_grace_seconds
+            .clamp(MIN_GRACE_SECS, MAX_GRACE_SECS);
+        self
+    }
+}
+
+pub struct SessionSettingsStore {
+    path: PathBuf,
+    cur: Mutex<Option<SessionSettings>>,
+}
+
+impl SessionSettingsStore {
+    /// Missing ⇒ unconfigured; corrupt ⇒ unconfigured **with a warning**, never a
+    /// startup failure.
+    pub fn load_from(path: PathBuf) -> Self {
+        let cur = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<SessionSettings>(&bytes) {
+                Ok(s) => Some(s.sanitized()),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(),
+                        "session-settings.json unreadable — using built-in defaults: {e}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        Self {
+            path,
+            cur: Mutex::new(cur),
+        }
+    }
+
+    pub fn get(&self) -> SessionSettings {
+        self.cur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Drives the console's "using defaults" hint.
+    pub fn configured(&self) -> bool {
+        self.cur.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Persist then adopt (sanitized first). Memory changes only if the write lands,
+    /// so a full disk cannot leave the running host disagreeing with its file.
+    pub fn set(&self, settings: SessionSettings) -> Result<()> {
+        let settings = settings.sanitized();
+        pf_paths::replace_secret_file(&self.path, &serde_json::to_vec_pretty(&settings)?)?;
+        *self.cur.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
+        Ok(())
+    }
+}
+
+/// Process-wide store, loaded once on first access. Same shape as
+/// `vdisplay::prefs()` / `pf_gpu::prefs()`: lifetime decisions happen in session
+/// teardown, where no app state is threaded.
+pub fn store() -> &'static SessionSettingsStore {
+    static STORE: OnceLock<SessionSettingsStore> = OnceLock::new();
+    STORE.get_or_init(|| {
+        SessionSettingsStore::load_from(pf_paths::config_dir().join("session-settings.json"))
+    })
+}
+
+/// The settings in force. A contract seat's are its profile's own file, else the built-in
+/// defaults with the box's choice of what a game's exit does to the stream
+/// (`seat_end_on_game_exit`).
+pub fn get() -> SessionSettings {
+    if pf_paths::seat::role().follows_contract() {
+        let own_desktop = cfg!(target_os = "linux") && pf_paths::seat::own_account();
+        let own = of_profile(&crate::library::View::here());
+        return contract_settings(own, pf_host_config::seat_defaults::current(), own_desktop);
+    }
+    store().get()
+}
+
+/// The file in a profile's library layer.
+const PROFILE_FILE: &str = "session-settings.json";
+
+/// The profile in `view`'s own settings, sanitized. `None` with no profile in view, and for an
+/// absent or malformed file.
+pub fn of_profile(view: &crate::library::View) -> Option<SessionSettings> {
+    let path = view.own_file(PROFILE_FILE)?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice::<SessionSettings>(&bytes)
+        .inspect_err(|e| tracing::warn!(path = %path.display(), error = %e, "profile session settings malformed — ignored"))
+        .ok()
+        .map(SessionSettings::sanitized)
+}
+
+/// Stores `settings` as the profile in `view`'s own. Refused with no profile in view.
+pub fn set_profile(view: &crate::library::View, settings: SessionSettings) -> Result<()> {
+    let path = view
+        .own_file(PROFILE_FILE)
+        .ok_or_else(|| anyhow::anyhow!("no profile in view"))?;
+    pf_paths::replace_secret_file(&path, &serde_json::to_vec_pretty(&settings.sanitized())?)?;
+    Ok(())
+}
+
+/// Drops the profile in `view`'s own settings, so its seat takes the box's Seat defaults again.
+/// Refused with no profile in view; an absent file is already dropped.
+pub fn clear_profile(view: &crate::library::View) -> Result<()> {
+    let path = view
+        .own_file(PROFILE_FILE)
+        .ok_or_else(|| anyhow::anyhow!("no profile in view"))?;
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(anyhow::Error::new(e).context(format!("remove {}", path.display())))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The seat defaults the box hands its seats: the box's own, or on a seat host its trust copy.
+pub fn box_seat_defaults() -> Option<pf_host_config::seat_defaults::SeatDefaults> {
+    use pf_host_config::seat_defaults::{of_box, SeatDefaults};
+    if pf_paths::seat::role().is_seat_host() {
+        return of_box();
+    }
+    Some(SeatDefaults::of(pf_host_config::config()))
+}
+
+/// What a seat's host plays a profile with: its own settings, else the box's seat defaults.
+/// On a person's own desktop (`own_desktop`) a game's exit goes back to that desktop whatever
+/// either chose: the stream is the person's session.
+pub fn contract_settings(
+    own: Option<SessionSettings>,
+    defaults: Option<pf_host_config::seat_defaults::SeatDefaults>,
+    own_desktop: bool,
+) -> SessionSettings {
+    let mut settings = own.unwrap_or_else(|| {
+        let mut s = SessionSettings::default();
+        if let Some(d) = defaults {
+            s.session_on_game_exit = d.end_on_game_exit;
+        }
+        s
+    });
+    if own_desktop {
+        settings.session_on_game_exit = false;
+    }
+    settings
+}
+
+/// Lifetime axes this build acts on, for the console to grey out the rest.
+/// Both directions need a launch path and process visibility; macOS has neither.
+pub fn enforced() -> Vec<String> {
+    // A contract seat has nothing to set: the box hands it the one choice it makes.
+    if pf_paths::seat::role().follows_contract() {
+        return Vec::new();
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        vec![
+            "session_on_game_exit".to_string(),
+            "game_on_session_end".to_string(),
+            "game_on_new_launch".to_string(),
+            "disconnect_grace_seconds".to_string(),
+        ]
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_the_documented_ones() {
+        let d = SessionSettings::default();
+        // session_on_game_exit ships on; both axes that can kill a game ship off.
+        assert!(d.session_on_game_exit);
+        assert_eq!(d.game_on_session_end, GameOnSessionEnd::Keep);
+        assert_eq!(d.game_on_new_launch, GameOnNewLaunch::Keep);
+        assert_eq!(d.disconnect_grace_seconds, 300);
+    }
+
+    #[test]
+    fn an_empty_object_decodes_to_the_defaults() {
+        // Every field is `#[serde(default)]`, so a partial or older writer still loads.
+        let s: SessionSettings = serde_json::from_str("{}").expect("empty object");
+        assert!(s.session_on_game_exit);
+        assert_eq!(s.game_on_session_end, GameOnSessionEnd::Keep);
+        assert_eq!(s.disconnect_grace_seconds, 300);
+        assert_eq!(s.version, 1);
+    }
+
+    #[test]
+    fn policy_names_are_snake_case_on_the_wire() {
+        // These strings are the API contract with the console.
+        let json = serde_json::to_string(&GameOnSessionEnd::OnQuit).unwrap();
+        assert_eq!(json, "\"on_quit\"");
+        let back: GameOnSessionEnd = serde_json::from_str("\"always\"").unwrap();
+        assert_eq!(back, GameOnSessionEnd::Always);
+        assert_eq!(GameOnSessionEnd::Keep.as_str(), "keep");
+    }
+
+    /// A made seat takes the box's choice of what a game's exit does; a person's own desktop
+    /// always goes back to that desktop.
+    #[test]
+    fn a_game_s_exit_on_a_person_s_own_desktop_keeps_the_stream() {
+        let ends = |end_on_game_exit| {
+            Some(pf_host_config::seat_defaults::SeatDefaults {
+                end_on_game_exit,
+                max_mode: None,
+                library_writable: false,
+                dualsense_usbip: false,
+                browser: false,
+                browser_origins: Vec::new(),
+                background_input: false,
+            })
+        };
+        assert!(contract_settings(None, None, false).session_on_game_exit);
+        assert!(contract_settings(None, ends(true), false).session_on_game_exit);
+        assert!(!contract_settings(None, ends(false), false).session_on_game_exit);
+        for defaults in [None, ends(true), ends(false)] {
+            assert!(!contract_settings(None, defaults, true).session_on_game_exit);
+        }
+    }
+
+    /// A profile's own file beats the box's seat defaults; a person's own desktop still forces
+    /// a game's exit back to that desktop.
+    #[test]
+    fn a_profile_s_own_settings_beat_the_seat_defaults() {
+        let ends = Some(pf_host_config::seat_defaults::SeatDefaults {
+            end_on_game_exit: true,
+            max_mode: None,
+            library_writable: false,
+            dualsense_usbip: false,
+            browser: false,
+            browser_origins: Vec::new(),
+            background_input: false,
+        });
+        let own = SessionSettings {
+            session_on_game_exit: false,
+            game_on_session_end: GameOnSessionEnd::OnQuit,
+            ..Default::default()
+        };
+        let got = contract_settings(Some(own.clone()), ends.clone(), false);
+        assert!(!got.session_on_game_exit);
+        assert_eq!(got.game_on_session_end, GameOnSessionEnd::OnQuit);
+        let kept = SessionSettings {
+            session_on_game_exit: true,
+            ..own
+        };
+        assert!(!contract_settings(Some(kept), ends, true).session_on_game_exit);
+    }
+
+    #[test]
+    fn grace_is_clamped_both_ways() {
+        let low = SessionSettings {
+            disconnect_grace_seconds: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(low.disconnect_grace_seconds, MIN_GRACE_SECS);
+        let high = SessionSettings {
+            disconnect_grace_seconds: u32::MAX,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(high.disconnect_grace_seconds, MAX_GRACE_SECS);
+    }
+
+    #[test]
+    fn missing_file_is_unconfigured_and_corrupt_file_does_not_fail() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("session-settings.json");
+        let store = SessionSettingsStore::load_from(path.clone());
+        assert!(!store.configured());
+        assert_eq!(store.get().game_on_session_end, GameOnSessionEnd::Keep);
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        let store = SessionSettingsStore::load_from(path.clone());
+        assert!(
+            !store.configured(),
+            "corrupt file must read as unconfigured"
+        );
+        assert!(store.get().session_on_game_exit, "defaults still apply");
+    }
+
+    #[test]
+    fn set_persists_sanitized_and_round_trips() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("session-settings.json");
+        let store = SessionSettingsStore::load_from(path.clone());
+        store
+            .set(SessionSettings {
+                version: 99,
+                game_on_session_end: GameOnSessionEnd::Always,
+                session_on_game_exit: false,
+                game_on_new_launch: GameOnNewLaunch::End,
+                disconnect_grace_seconds: 5,
+            })
+            .expect("write");
+        assert!(store.configured());
+        let got = store.get();
+        assert_eq!(got.game_on_session_end, GameOnSessionEnd::Always);
+        assert!(!got.session_on_game_exit);
+        assert_eq!(got.game_on_new_launch, GameOnNewLaunch::End);
+        assert_eq!(got.disconnect_grace_seconds, MIN_GRACE_SECS);
+        assert_eq!(got.version, 1, "version is normalized, not echoed");
+        let reloaded = SessionSettingsStore::load_from(path.clone());
+        assert_eq!(reloaded.get().game_on_session_end, GameOnSessionEnd::Always);
+        let files = std::fs::read_dir(td.path()).unwrap().count();
+        assert_eq!(files, 1, "the temp does not outlive the rename");
+    }
+}

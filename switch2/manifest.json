@@ -1,0 +1,53 @@
+{
+  "package_name": "Punktfunk_Switch2_Experimental_Ganesh_Hardening_20261118",
+  "qualification": "SOURCE_PATCH_ONLY__HARDWARE_VALIDATION_REQUIRED",
+  "upstream": "https://github.com/punktfunk/client-switch",
+  "official_client_pin": "a332988f7509bd4c6fbde7252bd1e2b874019f45",
+  "official_core_pin": "0fc1b6c115519551031c51a20c9dc598fb1ea57d",
+  "official_cargo_lock_git_blob": "e8c9787c5017d82dc4822a4236506b7c7382d0d4",
+  "requested_sdk_version": "20261114",
+  "requested_rust": "nightly-2026-10-04",
+  "host_tests_python": "Run bash build-switch2.sh --test (2026-11-18 patch environment: 39/39 PASS)",
+  "host_tests_C": [
+    "NV12 host ASan/UBSan PASS",
+    "H264 Annex B host ASan/UBSan PASS",
+    "FFI layout host PASS",
+    "Skia/newlib shim host ASan/UBSan with parallel reads PASS"
+  ],
+  "switch2_c_cross_build_in_this_environment": "NOT_RUN__OUNCE_SDK_UNAVAILABLE",
+  "rust_frontend_integration": "USER_CROSS_BUILD_LINKS_AND_PACKAGES_REAL_NRO_SHA256_806b506038863a46e3e9642924561476bcfa4221fbd3410c3213e673feeaf25c; RUNTIME_BLACK_SCREEN",
+  "frontend_entrypoint": "pf_nx_app::run(platform)",
+  "skia": "GANESH_VULKAN_ACTIVE__RASTER_FALLBACK__GPU_READBACK_ATTEMPTED",
+  "quic": "OFFICIAL_CORE_RETAINED; DRAIN_NOT_IMPLEMENTED",
+  "native_nro": null,
+  "hardware_test": "CURRENT_PATCH_UNTESTED_ON_DEVICE__PRIOR_BLACK_SCREEN_UNRESOLVED",
+  "reference_code_copied": false,
+  "skia_user_log_observed": "SKIA_NINJA_1370_PASS_BINDGEN_PASS_FRONTEND_RUST_COMPILES_TO_RUST_LLD",
+  "skia_revision": "m153-0.101.2",
+  "skia_fix": "HORIZON_PATCH_VERIFIED_IN_USER_NINJA_LOG; TARGET_CXX_BINDGEN_HEADERS_PREFLIGHT_NOT_CROSS_VERIFIED",
+  "bindgen_preflight": "USER_CACHYOS_17_11_2026_PASS",
+  "reused_previous_build": "SUPPORTED_VIA_RESUME_SKIA_SCRIPT_WITHOUT_PROMISING_INCREMENTAL_CACHE_HIT",
+  "resume_test_fix": "ISOLATED_TEST_FIXTURE_ENV_NO_CHANGE_TO_REAL_CROSS_BUILD",
+  "link_collision_fix": "GUARD_OFFICIAL_PF_NX_SYS_VI_AND_FB_MODULES_BY_PF2_SWITCH2_CFG",
+  "user_link_stage": "RUST_LLD_UNDEFINED_SYMBOLS_MMAP_MUNMAP_PREAD_FROM_SKIA_AND_ICU",
+  "skia_newlib_link_fix": "TARGET_ONLY_SHIM_FROM_OFFICIAL_CLIENT_SKIA_COMPAT_C_WEAK_SYMBOLS_AND_RUST_ARCHIVE_LINK_ANCHOR",
+  "rust_link_fix_status": "USER_RELEASE_ELF_AND_NRO_SUCCEEDED; CONSOLE_BOOT_SUCCESS_BUT_BLACK_SCREEN",
+  "manifest_schema_note": "Only real user cross-build log qualifies AArch64 linker status",
+  "user_hardware_test": "2026-11-17 user confirms NRO starts but display black; log shows empty fallback faces, 50.961s warm_up, suspend; diagnosis ongoing",
+  "black_screen_changes": [
+    "Switch 2 official UI warm-up skip retained",
+    "pl:u system fonts via pf-nx-sys retained",
+    "PF2_SCANOUT_PROBE=1 optional blue/green + white square diagnostic",
+    "Ganesh Vulkan read_back attempts actual GPU SkSurface pixels",
+    "Submit error invalidates presenter; fence and binary semaphores recreated in resize",
+    "Vulkan device-lost remains unrecoverable on current device",
+    "Legacy QA assertion replaced; native host gate added"
+  ],
+  "patch_limitations": [
+    "No SDK cross-build performed in patch environment",
+    "No on-device presentation/readback/120 Hz qualification",
+    "One queue still uses blocking GPU synchronization",
+    "mDNS errno 9997 requires hardware/LAN reproduction",
+    "pread shim synchronization does not cover external users of the same fd"
+  ]
+}

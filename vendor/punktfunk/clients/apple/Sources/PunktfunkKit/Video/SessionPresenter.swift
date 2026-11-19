@@ -1,0 +1,638 @@
+// Per-session presenter stack shared by the Apple stream views.
+//
+// Explicit VideoToolbox decode is the default, presented by Metal. Which pacing a platform
+// takes is decided in `PresenterChoice.platformDefault` and stated only there. The latency
+// intent keeps no app buffer; smoothness retains an explicit FIFO. Stage-1's compressed
+// AVSampleBufferDisplayLayer remains a diagnostic/fallback.
+//
+// Views own capture, geometry, and ordinary display links; this type owns presenter lifecycle.
+// Start, layout, stop, and ordinary display-link ticks run on the main thread.
+
+#if canImport(Metal) && canImport(QuartzCore)
+import AVFoundation
+import Foundation
+import PunktfunkShared
+import QuartzCore
+#if os(tvOS) || os(iOS)
+import UIKit
+#endif
+
+private let presentLog = ClientLog(category: "present")
+
+/// Weak-target wrapper for CADisplayLink. The link retains its target, so targeting a view or
+/// presenter directly makes a `owner → link → owner` cycle that only `invalidate()` breaks — if a
+/// teardown is ever missed the owner leaks and keeps ticking. The proxy is what the link retains;
+/// the handler closure captures the owner `[weak]`, so the owner can deallocate and its `deinit`
+/// invalidate the link.
+public final class DisplayLinkProxy: NSObject {
+    private let onTick: (CADisplayLink) -> Void
+    public init(_ onTick: @escaping (CADisplayLink) -> Void) { self.onTick = onTick }
+    @objc public func tick(_ link: CADisplayLink) { onTick(link) }
+}
+
+/// What a wedge report gets (the pipeline's own relink came first, `LinkStallPolicy`). When
+/// tvOS re-plumbs the display, the layer on screen never shows a frame again, and a fresh one
+/// shows only once the display finishes, about five seconds on: so one fresh layer, then hold
+/// with the link armed. A rebuild during that wait starts it over. A clean run longer than
+/// `resetAfter` earns the next wedge a fresh layer again. Internal for tests.
+struct WedgePolicy {
+    enum Action { case rebuild, hold }
+    let resetAfter: CFTimeInterval
+    private(set) var wedges = 0
+    private var last: CFTimeInterval = -.infinity
+    init(resetAfter: CFTimeInterval = 30) { self.resetAfter = resetAfter }
+    mutating func next(now: CFTimeInterval) -> Action {
+        if now - last > resetAfter { wedges = 0 }
+        last = now
+        wedges += 1
+        return wedges == 1 ? .rebuild : .hold
+    }
+}
+
+/// Selects a session's presentation mechanism.
+///
+/// Stage-2/3/4 share explicit decode and the Metal renderer, using arrival, on-glass-gated, or
+/// CAMetalDisplayLink pacing. `decoded` keeps explicit decode but sends its IOSurface directly to
+/// the system video renderer, an env-only A/B on iOS and tvOS. Stage-1 sends compressed samples to that renderer and remains a debug
+/// diagnostic because its internal decoder cannot participate in recovery or decode metering.
+///
+/// Internal rather than private for resolution tests.
+enum PresenterChoice: Equatable {
+    case stage1
+    case stage2
+    case stage3
+    case stage4
+    case decoded
+
+    /// Resolve from the `PUNKTFUNK_PRESENTER` env override (an A/B lever, no setting); anything
+    /// unknown, or an empty env var, falls back to the platform default.
+    static func resolve(env: String?) -> PresenterChoice {
+        explicit(env: env) ?? platformDefault
+    }
+
+    /// Resolve an explicit diagnostic override, or nil for no supported selection.
+    ///
+    /// Stage-2 remains a faithful arrival-pacing A/B. Stage-4 is refused on macOS, whose
+    /// path has separate synchronization constraints. `decoded` (the video-plane A/B) needs
+    /// iOS/tvOS 17.4 for its displayed-IOSurface metering.
+    static func explicit(env: String?) -> PresenterChoice? {
+        switch env {
+        case "stage1": return .stage1
+        case "stage2": return .stage2
+        case "stage3": return .stage3
+        case "stage4":
+            #if os(macOS)
+            return nil
+            #else
+            return .stage4
+            #endif
+        case "decoded":
+            #if os(tvOS) || os(iOS)
+            if #available(iOS 17.4, tvOS 17.4, *) { return .decoded }
+            return nil
+            #else
+            return nil
+            #endif
+        default: return nil
+        }
+    }
+
+    /// macOS uses arrival-paced Metal; iOS, tvOS and visionOS deadline-paced Metal.
+    ///
+    /// The deadline link presents each drawable as late as its deadline allows
+    /// (`DeadlinePacer`). Filmed at 240 fps on a 60 Hz Apple TV, a late pick answered controller
+    /// presses 9 ms sooner than the decoded video plane, whose displayed-surface metric reads
+    /// about a refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
+    static var platformDefault: PresenterChoice {
+        #if os(macOS)
+        return .stage2
+        #else
+        return .stage4
+        #endif
+    }
+}
+
+/// The user's presentation INTENT. Two intents, one engine per platform:
+///
+/// - `.latency` (the default): no deliberate app buffer. Metal keeps the newest frame or two;
+///   the `decoded` A/B submits directly and drops on renderer backpressure. Jitter becomes a
+///   repeat or drop rather than standing latency.
+/// - `.smooth(buffer:)`: a small deliberate jitter buffer (`FrameStorePolicy.fifo`) evens the present
+///   cadence at the cost of `buffer` refresh intervals of added display latency — which the HUD
+///   SHOWS (only the OS floor is shaved, never the user's chosen buffer). `buffer` ∈ 1…3;
+///   the "Automatic" setting (stored 0) currently maps to 2.
+///
+/// Mechanism stays internal: intents map onto `PresentPacing`/`FrameStorePolicy` per platform
+/// in `SessionPresenter.start`; the stage ladder survives only as the PUNKTFUNK_PRESENTER debug
+/// env lever. Internal (not private) for unit tests.
+enum PresentPriority: Equatable {
+    case latency
+    case smooth(buffer: Int)
+
+    /// Resolve from the persisted settings: `DefaultsKey.presentPriority` ("latency" default;
+    /// anything but "smooth" — unset, garbage, a synced unknown future value — falls back to
+    /// latency) and `DefaultsKey.smoothBuffer` (0/out-of-range = Automatic = 2).
+    static func resolve(setting: String?, bufferSetting: Int?) -> PresentPriority {
+        guard setting == "smooth" else { return .latency }
+        let raw = bufferSetting ?? 0
+        return .smooth(buffer: (1...3).contains(raw) ? raw : 2)
+    }
+
+    /// The frame hand-off policy this intent runs (see `FrameStore`).
+    var storePolicy: FrameStorePolicy {
+        switch self {
+        case .latency: return .newestWins
+        case .smooth(let buffer): return .fifo(capacity: buffer)
+        }
+    }
+}
+
+@MainActor
+final class SessionPresenter {
+    /// Map a presenter choice and codec to its execution path.
+    ///
+    /// The decoded tvOS path requires a CVPixelBuffer, so PyroWave retains deadline-paced Metal.
+    /// Stage-3 and stage-4 map directly to glass and deadline pacing; stage-2 is arrival for every
+    /// codec. Glass gating waits for the previous frame's on-glass callback, about a refresh per
+    /// frame.
+    nonisolated static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
+        if choice == .decoded { return codec == .pyrowave ? .deadline : .decoded }
+        if choice == .stage4 { return .deadline }
+        if choice == .stage3 { return .glass }
+        return .arrival
+    }
+
+    /// `decoded` is reached only through `PUNKTFUNK_PRESENTER=decoded`. Its sink is zero-buffer
+    /// and was only tried with biplanar 4:2:0, so Smoothness and 4:4:4 keep deadline Metal.
+    nonisolated static func effectivePacing(
+        _ selected: PresentPacing, priority: PresentPriority, videoLayerCompatible: Bool = true
+    ) -> PresentPacing {
+        if selected == .decoded, priority != .latency || !videoLayerCompatible { return .deadline }
+        return selected
+    }
+
+    #if os(macOS)
+    /// Adaptive-refresh latency sessions choose immediate sparse presents or one dense present per
+    /// display-link target: on arrival, a 120 fps stream on a ProMotion panel loses about a tenth
+    /// to a fifth of its frames, PyroWave included. Smoothness and the other presenters keep their
+    /// own pacing mechanisms.
+    nonisolated static func adaptiveSlotPaced(
+        adaptiveSync: Bool, priority: PresentPriority, pacing: PresentPacing
+    ) -> Bool {
+        adaptiveSync && priority == .latency && pacing == .arrival
+    }
+    #endif
+
+    /// The glass gate's in-flight present budget (`PresentGate` capacity): 1 everywhere.
+    ///
+    /// Any second gate slot becomes a STANDING queue: a burst fills it, presents and latches
+    /// then run at the same rate, so the occupancy never returns to zero and every frame rides
+    /// one extra refresh per slot. Low latency needs a path that cannot build that queue
+    /// (deadline pacing, the decoded video plane), not a deeper gate.
+    ///
+    /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
+    /// stays reproducible on-device; macOS is pinned to 1, env ignored. Internal (not private)
+    /// for unit tests.
+    nonisolated static func gateDepth(env: String?) -> Int {
+        #if os(macOS)
+        return 1
+        #else
+        if let env, let depth = Int(env), (1...3).contains(depth) { return depth }
+        return 1
+        #endif
+    }
+
+    /// The ordinary display link's frame-rate hint for a stream of `hz` (see `syncFrameRate`).
+    /// macOS spans 24…`hz` with VRR on and fixes min = max at `hz` with it off. Elsewhere this
+    /// link exists only off deadline pacing (an env A/B, the visionOS curve): a 120 ceiling
+    /// (mandatory, or ProMotion caps the link at 60) with a 24/30 Hz floor.
+    /// Internal (not private) for unit tests.
+    nonisolated static func frameRateRange(hz: Float, allowVRR: Bool) -> CAFrameRateRange {
+        #if os(macOS)
+        let minimum = allowVRR ? min(hz, 24) : hz
+        return CAFrameRateRange(minimum: minimum, maximum: hz, preferred: hz)
+        #else
+        let floor = allowVRR ? min(hz, 24) : min(hz, 30)
+        return CAFrameRateRange(minimum: floor, maximum: max(hz, 120), preferred: hz)
+        #endif
+    }
+
+    #if os(visionOS)
+    /// The curved screen while a volume shows the picture.
+    private(set) var curve: CurveTarget?
+
+    /// Draw into `target`, or back into the layer with nil. Costs one IDR. Main thread.
+    func setCurve(_ target: CurveTarget?) {
+        guard target !== curve else { return }
+        curve = target
+        restartPresentation()
+    }
+    #endif
+
+    private var pump: StreamPump?
+    private var stage2: Stage2Pipeline?
+    private var stage2Link: CADisplayLink?
+    /// iOS: runs `pushHeadroom` twice a second. Headroom follows brightness and posts no change
+    /// notification; the linear HDR shaders roll highlights onto it.
+    private var headroomTimer: Timer?
+    #if os(iOS)
+    /// Stage the EDR headroom of the screen the app is on, current and potential.
+    private static func pushHeadroom(to pipeline: Stage2Pipeline?) {
+        let screen = NativeDisplay.screen
+        pipeline?.setDisplayHeadroom(
+            screen.currentEDRHeadroom, potential: screen.potentialEDRHeadroom)
+    }
+    #endif
+    private var panel = PanelInfo(minHz: 0, maxHz: 0)
+
+    /// The hosting screen's refresh range and granularity, from the view on start and every
+    /// layout (a window can move screens). Main thread. Diagnostics only.
+    func setPanel(_ info: PanelInfo) {
+        panel = info
+        stage2?.setPanel(info)
+    }
+    private var metalLayer: CAMetalLayer?
+    private var connection: PunktfunkConnection?
+    /// Re-runs this session's `start` with its own arguments on the given base layer — the
+    /// wedged-presenter cure (`rebuildPresentation`) and the move between screens (`move(to:)`).
+    /// Set by `start`, cleared by `stop`. Main-thread only.
+    private var restart: ((AVSampleBufferDisplayLayer) -> Void)?
+    /// The base layer the running session presents into. Main-thread only.
+    private var baseLayer: AVSampleBufferDisplayLayer?
+    /// The last `layout` call, replayed after a rebuild so the new sublayer has a frame
+    /// before its first present. Main-thread only.
+    private var lastLayout: (bounds: CGRect, contentsScale: CGFloat)?
+    /// The decoded frame's REAL pixel dimensions (ground truth, pushed by the view from the pump's
+    /// `onDecodedSize` new-mode-IDR callback). Used for the aspect-fit in `layout` in preference to
+    /// `connection.currentMode()`, which (a) lags a mid-stream resize — it only updates on the
+    /// `Reconfigured` ack, and a resize-END produces no bounds change to re-run `layout` afterward —
+    /// and (b) can disagree with what the host actually DELIVERED (Windows corrective-ack falls back
+    /// to an advertised mode). The pixels we're drawing are the only correct aspect source; a wrong
+    /// one here is the "black bars + stretched" resize artifact. nil until the first frame → `layout`
+    /// falls back to `currentMode()`. Main-thread only.
+    private var contentSize: CGSize?
+    /// The screen verdict the running pipeline chose its pacing from, and its live source.
+    private var builtAdaptive = false
+    /// The window's Direct verdict (`setDirectPossible`), re-applied to each pipeline built.
+    private var directPossible = true
+    private var adaptiveSync: () -> Bool = { false }
+    /// The window, scene and display around the layer, for the wedge line. Main thread.
+    var surfaceState: (() -> String)?
+    private var wedgePolicy = WedgePolicy()
+
+    /// Start the resolved presenter for `connection`.
+    ///
+    /// Stage-1 sends compressed samples to `baseLayer`; tvOS's decoded path sends it VideoToolbox
+    /// output. Metal paths leave that layer idle and overlay their own CAMetalLayer. The supplied
+    /// display-link factory tracks the hosting display for ordinary pacing and decoded-frame
+    /// metering; deadline pacing owns a CAMetalDisplayLink instead.
+    ///
+    /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
+    /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
+    /// `screen` past 0 presents that further screen of the session, on Metal only.
+    func start(
+        connection: PunktfunkConnection,
+        baseLayer: AVSampleBufferDisplayLayer,
+        endToEndMeter: LatencyMeter?,
+        makeDisplayLink: @escaping (AnyObject, Selector) -> CADisplayLink,
+        onFrame: (@Sendable (AccessUnit) -> Void)?,
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
+        onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
+        adaptiveSync: @escaping () -> Bool = { false },
+        screen: UInt8 = 0
+    ) {
+        stop()
+        self.connection = connection
+        self.baseLayer = baseLayer
+        self.adaptiveSync = adaptiveSync
+        builtAdaptive = adaptiveSync()
+        restart = { [weak self] layer in
+            guard let self else { return }
+            start(
+                connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
+                makeDisplayLink: makeDisplayLink,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
+                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync, screen: screen)
+        }
+
+        // Explicit decode stays default so loss recovery and decode metering survive. The pacing
+        // comes from `PresenterChoice.platformDefault`; PUNKTFUNK_PRESENTER overrides it for A/B.
+        // The latency/smoothness intent selects zero buffering or an explicit FIFO. Stage-1 is
+        // the Metal-missing fallback.
+        let choice = PresenterChoice.resolve(
+            env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"])
+        let selectedPacing = Self.pacing(for: choice, codec: connection.videoCodec)
+        let priority = PresentPriority.resolve(
+            setting: connection.settings.presentPriority,
+            bufferSetting: connection.settings.smoothBuffer)
+        // Direct video presentation is the zero-buffer latency path. A user who asks for a
+        // smoothness buffer keeps the existing deadline engine, where FrameStore owns that buffer.
+        let effective = Self.effectivePacing(
+            selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
+        #if os(visionOS)
+        // The curve's queue vends its own drawables: frames draw on arrival.
+        let pacing = curve != nil ? PresentPacing.arrival : effective
+        #else
+        let pacing = effective
+        #endif
+        #if os(macOS)
+        let vsyncPaced = priority != .latency && pacing == .arrival
+        let adaptiveSlotPaced = Self.adaptiveSlotPaced(
+            adaptiveSync: builtAdaptive, priority: priority, pacing: pacing)
+        #else
+        let vsyncPaced = false
+        let adaptiveSlotPaced = false
+        #endif
+        if choice != .stage1,
+           let pipeline = Stage2Pipeline(
+               endToEndMeter: endToEndMeter,
+               videoRenderer: pacing == .decoded ? baseLayer.sampleBufferRenderer : nil,
+               pacing: pacing,
+               gateDepth: Self.gateDepth(
+                   env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
+               storePolicy: priority.storePolicy,
+               vsyncPaced: vsyncPaced,
+               adaptiveSlotPaced: adaptiveSlotPaced) {
+            pipeline.onPresentWedged = { [weak self, weak pipeline] in
+                DispatchQueue.main.async {
+                    // A report queued before a restart must not rebuild the successor.
+                    guard let self, let pipeline, self.stage2 === pipeline else { return }
+                    self.rebuildPresentation()
+                }
+            }
+            let metal = pipeline.layer
+            // Metal pacing overlays the idle video layer. The decoded path leaves the backing
+            // video layer exposed and submits VideoToolbox output directly to its renderer.
+            if pacing != .decoded {
+                baseLayer.addSublayer(metal)
+                metalLayer = metal
+            }
+            stage2 = pipeline
+            pipeline.setDirectPossible(directPossible)
+            #if os(visionOS)
+            pipeline.setCurve(curve)
+            #endif
+            // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
+            // and polls which decoded IOSurface reached glass. Frame arrival remains the render
+            // trigger. Deadline pacing owns its drawable-vending CAMetalDisplayLink instead.
+            if pacing != .deadline {
+                let proxy = DisplayLinkProxy { [weak self] link in
+                    self?.stage2?.renderTick(
+                        targetMediaTime: link.targetTimestamp,
+                        displayedMediaTime: link.timestamp,
+                        period: link.targetTimestamp - link.timestamp)
+                }
+                let link = makeDisplayLink(proxy, #selector(DisplayLinkProxy.tick(_:)))
+                link.add(to: .main, forMode: .common)
+                stage2Link = link
+            }
+            syncFrameRate(hz: connection.currentMode().refreshHz)
+            #if os(iOS)
+            Self.pushHeadroom(to: pipeline)
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { Self.pushHeadroom(to: self?.stage2) }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            headroomTimer = timer
+            #endif
+            pipeline.setPanel(panel)
+            pipeline.start(
+                connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
+                onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR, screen: screen)
+        } else if screen == 0 {
+            let pump = StreamPump()
+            pump.start(
+                connection: connection, layer: baseLayer, endToEndMeter: endToEndMeter,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
+            self.pump = pump
+        }
+    }
+
+    /// Hint the display link with the stream's cadence. On iOS/tvOS a range is always required:
+    /// without one, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
+    /// `CADisableMinimumFrameDurationOnPhone` in Info.plist), so a 120 fps stream would present
+    /// at half rate with the ring silently dropping every other frame. `maximum` allows up to 120
+    /// so the system MAY tick faster than a sub-120 stream (each extra tick is a near-free empty
+    /// `renderTick`, and presenting on a denser grid shortens the decode→glass wait).
+    ///
+    /// The `allowVRR` setting (default on) widens that hint into a true variable-refresh request:
+    /// `preferred` = the stream rate with a low floor, so an adaptive-sync display can drop its
+    /// physical refresh to match the content. It reaches this link only; under deadline pacing
+    /// `FrameRateHint` pins the rate and the setting is not read (see `frameRateRange`).
+    /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
+    private func syncFrameRate(hz: UInt32) {
+        guard hz > 0 else { return }
+        // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
+        // applied from the link's own thread — see Stage2Pipeline.setFrameRateHint). A no-op
+        // under arrival/glass pacing, where the CADisplayLink below is the one hinted link.
+        stage2?.setFrameRateHint(hz: Float(hz))
+        guard let link = stage2Link else { return }
+        let range = Self.frameRateRange(
+            hz: Float(hz), allowVRR: connection?.settings.allowVRR ?? true)
+        if link.preferredFrameRateRange != range { link.preferredFrameRateRange = range }
+        #if os(macOS)
+        // The requested range and its readback on every sync (layout, fullscreen and screen
+        // transitions re-apply it) — diagnostics only, the readback is the API's one clamp signal.
+        if presentDebug {
+            let actual = link.preferredFrameRateRange
+            print(String(
+                format: "pf-present-range requested=%.0f-%.0f@%.0f actual=%.0f-%.0f@%.0f",
+                range.minimum, range.maximum, range.preferred ?? 0,
+                actual.minimum, actual.maximum, actual.preferred ?? 0))
+            fflush(stdout)
+        }
+        #endif
+    }
+
+    /// The system scaler's closest match to `fit`, for the AVSampleBufferDisplayLayer paths
+    /// (stage 1, tvOS's decoded plane). It does not snap like the placement does.
+    nonisolated static func gravity(_ fit: VideoFit) -> AVLayerVideoGravity {
+        switch fit {
+        case .fit: return .resizeAspect
+        case .crop: return .resizeAspectFill
+        case .stretch: return .resize
+        }
+    }
+
+    /// Refresh display timing and position a Metal presentation layer.
+    ///
+    /// Every explicit-decode path updates its display link after reconfiguration, including tvOS's
+    /// decoded video plane. Metal paths then place their sublayer and size its drawable in backing
+    /// pixels so the shader owns scaling. The video layer uses `videoGravity` (see
+    /// `SessionPresenter.gravity(_:)`) and needs no geometry here.
+    ///
+    /// No-op before a connection starts and for stage-1 beyond the harmless timing update.
+    func layout(in bounds: CGRect, contentsScale: CGFloat) {
+        lastLayout = (bounds, contentsScale)
+        guard let connection else { return }
+        let mode = connection.currentMode()
+        syncFrameRate(hz: mode.refreshHz)
+        guard let metalLayer else { return }
+        // Frame size: the ACTUAL decoded dims when known (survives a lagging `currentMode()` and a
+        // host that delivered a different size than requested), else the negotiated mode. The shader
+        // stretches its source rect across the WHOLE drawable, so a stale size here is the
+        // post-resize black-bars+stretch.
+        let aspect: CGSize? = {
+            if let c = contentSize, c.width > 0, c.height > 0 { return c }
+            if mode.width > 0, mode.height > 0 {
+                return CGSize(width: Int(mode.width), height: Int(mode.height))
+            }
+            return nil
+        }()
+        // Place the picture in BACKING PIXELS (`VideoPlacement`, the rule every client shares): a
+        // metal sublayer whose frame doesn't land on whole device pixels is RESAMPLED by the
+        // compositor — a uniform soft blur even when the drawable itself is 1:1 — so the layer takes
+        // the placement's whole-pixel rect, and the drawable shows its `src` part of the frame.
+        let scale = contentsScale > 0 ? contentsScale : 1
+        let viewPx = (width: Int((bounds.width * scale).rounded()), height: Int((bounds.height * scale).rounded()))
+        let placement = aspect.map {
+            VideoFit(name: connection.settings.videoFit)
+                .place(view: viewPx, frame: (Int($0.width), Int($0.height)))
+        }
+        let snapped: CGRect
+        if let p = placement, !p.isEmpty, let frame = aspect {
+            #if os(macOS)
+            // AppKit layer geometry is bottom-left; the placement's rows count from the top.
+            let yPx = viewPx.height - p.dstY - p.dstHeight
+            #else
+            let yPx = p.dstY
+            #endif
+            snapped = CGRect(
+                x: bounds.minX + CGFloat(p.dstX) / scale, y: bounds.minY + CGFloat(yPx) / scale,
+                width: CGFloat(p.dstWidth) / scale, height: CGFloat(p.dstHeight) / scale)
+            stage2?.setSourceRect(CGRect(
+                x: p.srcX / frame.width, y: p.srcY / frame.height,
+                width: p.srcWidth / frame.width, height: p.srcHeight / frame.height))
+        } else {
+            snapped = CGRect(
+                x: (bounds.origin.x * scale).rounded() / scale,
+                y: (bounds.origin.y * scale).rounded() / scale,
+                width: CGFloat(viewPx.width) / scale, height: CGFloat(viewPx.height) / scale)
+            stage2?.setSourceRect(CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        // No implicit resize animation; contentsScale tracks the view's backing/display scale.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.contentsScale = contentsScale
+        metalLayer.frame = snapped
+        CATransaction.commit()
+        // Hand the resulting pixel size to the render thread (it must not read layer geometry
+        // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
+        // the drawable's texel count equals the on-screen device-pixel count exactly (1 texel ↔ 1
+        // device pixel); with the frame snapped, this equals the pre-snap rounded value, so the
+        // decoded↔drawable 1:1 the log confirmed is preserved.
+        stage2?.setDrawableTarget(CGSize(
+            width: (snapped.width * scale).rounded(),
+            height: (snapped.height * scale).rounded()))
+        #if os(tvOS)
+        // Push the display's live EDR headroom alongside: > 1 means the TV is composited in an
+        // HDR mode (the session's AVDisplayManager request landed — see StreamViewIOS), and HDR
+        // frames flip to PQ passthrough. The stream view also re-layouts on mode-switch/screen-
+        // mode notifications, so a mid-session switch reaches here without a bounds change.
+        stage2?.setDisplayHeadroom(
+            UIScreen.main.currentEDRHeadroom, potential: UIScreen.main.potentialEDRHeadroom)
+        #endif
+    }
+
+    #if os(tvOS)
+    /// The HDMI output switched into (or out of) the session's HDR mode: HDR frames present as
+    /// PQ passthrough while it holds. Main thread; the stream view watches the switch.
+    func setHDROutput(_ on: Bool) {
+        stage2?.setHDROutput(on)
+    }
+    #endif
+
+    /// Record the decoded frame's real dimensions (the view hops the pump's `onDecodedSize` to main
+    /// and calls this) so `layout` aspect-fits to what's actually on screen instead of the possibly-
+    /// stale `currentMode()`. Only stores — the caller re-runs `layout` right after, because a
+    /// resize-END produces no bounds change to trigger one. No-op on a zero/unchanged size.
+    func setContentSize(_ size: CGSize) {
+        guard size.width > 0, size.height > 0, size != contentSize else { return }
+        contentSize = size
+    }
+
+    /// Rebuild the presentation on `layer`, keeping the connection: the picture moving between
+    /// the phone and an attached monitor. The fresh display link binds to the screen `layer` is
+    /// on. Costs one IDR; the caller re-runs `layout` for the new geometry. No-op before a session
+    /// starts or when already on `layer`. Main thread.
+    func move(to layer: AVSampleBufferDisplayLayer) {
+        guard let restart, layer !== baseLayer else { return }
+        let size = contentSize
+        restart(layer)
+        contentSize = size // the view drops the new pipeline's repeat of this size
+    }
+
+    /// The window moved to another screen. Pacing is chosen at build time, so rebuild (one IDR)
+    /// only when the fixed-vs-adaptive verdict flipped. Main thread.
+    func screenChanged() {
+        guard restart != nil, adaptiveSync() != builtAdaptive else { return }
+        restartPresentation()
+    }
+
+    /// Whether the window is fullscreen, so can scan out Direct. Kept for each pipeline this
+    /// presenter builds. Main thread.
+    func setDirectPossible(_ possible: Bool) {
+        directPossible = possible
+        stage2?.setDirectPossible(possible)
+    }
+
+    /// `onPresentWedged`'s cure, hopped to MAIN, by `WedgePolicy`: a fresh pipeline, presenter
+    /// and CAMetalLayer on the SAME connection (the new pump asks the host for one IDR), or hold.
+    /// The line names the window, scene and display around the layer. Main thread.
+    private func rebuildPresentation() {
+        guard restart != nil, baseLayer != nil else { return }
+        let action = wedgePolicy.next(now: CACurrentMediaTime())
+        let what = action == .rebuild
+            ? "rebuilding pipeline, presenter and layer" : "holding, the link stays armed"
+        let layer = metalLayer.map {
+            "frame=\($0.frame) hidden=\($0.isHidden) opacity=\($0.opacity) drawable=\($0.drawableSize)"
+        } ?? "-"
+        let line = "presenter wedged ×\(wedgePolicy.wedges) — \(what); layer \(layer); "
+            + (surfaceState?() ?? "-")
+        presentLog.error("\(line, privacy: .public)")
+        if action == .rebuild { restartPresentation() }
+    }
+
+    /// Re-run `start` on the live base layer and replay the last layout so the new sublayer has
+    /// a frame before the first present. `start`→`stop` clears `contentSize`, and the view dedups
+    /// the repeated decoded-size callback — so the known size is restored here, same as
+    /// `move(to:)`, or layout falls back to a stale negotiated aspect. Main thread.
+    private func restartPresentation() {
+        guard let restart, let baseLayer else { return }
+        let size = contentSize
+        restart(baseLayer)
+        contentSize = size
+        if let lastLayout { layout(in: lastLayout.bounds, contentsScale: lastLayout.contentsScale) }
+    }
+
+    /// Stop the active pump or pipeline (each joins its threads, ≤ one poll timeout) and detach
+    /// the stage-2 layer + link. Does not close the connection — that stays with whoever owns it.
+    /// Idempotent.
+    func stop() {
+        restart = nil
+        baseLayer = nil
+        contentSize = nil // a new session re-derives it from its first frame
+        pump?.stop()
+        pump = nil
+        stage2Link?.invalidate()
+        stage2Link = nil
+        headroomTimer?.invalidate()
+        headroomTimer = nil
+        stage2?.stop() // stops the pump (synchronous join) + drops the decode session
+        stage2 = nil
+        metalLayer?.removeFromSuperlayer()
+        metalLayer = nil
+        connection = nil
+    }
+
+    isolated deinit {
+        // The owning view's stop() normally ran already; this covers a missed teardown so the
+        // display link can't keep ticking a deallocated pipeline.
+        stage2Link?.invalidate()
+        headroomTimer?.invalidate()
+        stage2?.stop()
+        pump?.stop()
+    }
+}
+#endif

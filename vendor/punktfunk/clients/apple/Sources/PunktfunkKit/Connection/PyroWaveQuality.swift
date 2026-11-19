@@ -1,0 +1,66 @@
+// PyroWave quality as the player reads it: the rate it needs at the picture the host encodes,
+// and the warning when this device's link is short of it. Core prices both, so every client
+// words them the same way.
+
+import Foundation
+import PunktfunkCore
+import PunktfunkShared
+
+public enum PyroWaveQuality {
+    /// Core's `BPP_FLOOR` to `BPP_MAX`, by tenths.
+    public static let range = 0.5...2.0
+    public static let rungs = stride(
+        from: Int(range.lowerBound * 10), through: Int(range.upperBound * 10), by: 1
+    ).map { Double($0) / 10 }
+
+    /// `bpp` on the nearest rung.
+    public static func snapped(_ bpp: Double) -> Double {
+        (min(max(bpp, range.lowerBound), range.upperBound) * 10).rounded() / 10
+    }
+
+    /// This device's link toward its default route: a `PUNKTFUNK_IFACE_KIND_*` and Mbit/s,
+    /// `0` where the OS did not say. A route lookup: nothing is sent.
+    public static func localLink() -> (kind: UInt8, mbps: UInt32) {
+        var kind: UInt8 = 0
+        var mbps: UInt32 = 0
+        _ = punktfunk_local_link_facts(nil, &kind, &mbps)
+        return (kind, mbps)
+    }
+
+    /// The kbps `s`'s quality needs at `mode`. 4:4:4 follows its switch, and the depth is the one
+    /// a connect offers (`ConnectOffer.tenBit`): HDR prices 10 bits only on a display that
+    /// shows it.
+    public static func kbps(
+        _ s: EffectiveSettings, mode: (width: UInt32, height: UInt32, hz: UInt32),
+        displayHDR: Bool
+    ) -> UInt32 {
+        punktfunk_pyrowave_kbps(
+            mode.width, mode.height, mode.hz, s.enable444,
+            ConnectOffer.tenBit(s, displayHDR: displayHDR) ? 10 : 8, s.pyrowaveBppX100)
+    }
+
+    /// The row's caption, `3840×2160 at 120 Hz: 1.6 Gbit/s`, and the warning when `link` is
+    /// short of that rate.
+    public static func lines(
+        _ s: EffectiveSettings, mode: (width: UInt32, height: UInt32, hz: UInt32),
+        link: (kind: UInt8, mbps: UInt32), displayHDR: Bool
+    ) -> (caption: String, warning: String?) {
+        let need = kbps(s, mode: mode, displayHDR: displayHDR)
+        var buf = [CChar](repeating: 0, count: 160)
+        _ = punktfunk_pyrowave_link_warning(need, link.kind, link.mbps, &buf, UInt(buf.count))
+        let warning = String(cString: buf)
+        let caption = L10n.playerPyrowaveBppRate(
+            width: String(mode.width), height: String(mode.height), hz: String(mode.hz),
+            rate: rateLabel(kbps: need))
+        return (caption, warning.isEmpty ? nil : warning)
+    }
+
+    /// `kbps` as a player reads it, as core's `pyrowave::rate` counts: `940 Mbit/s`, `1.3 Gbit/s`.
+    public static func rateLabel(kbps: UInt32) -> String {
+        let mbps = (UInt64(kbps) + 500) / 1000
+        if mbps < 1000 { return L10n.commonMbits(value: String(mbps)) }
+        var gbps = String(format: "%.1f", Double(kbps) / 1e6)
+        if gbps.hasSuffix(".0") { gbps.removeLast(2) }
+        return L10n.commonGbits(value: gbps)
+    }
+}

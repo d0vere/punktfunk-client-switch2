@@ -1,0 +1,227 @@
+---
+title: Plugins
+description: Plugins bring your game launchers into the library, sync a ROM collection or Playnite library, and hand a USB device on the couch to the host.
+---
+
+Install plugins to fill the host's [game library](/docs/game-library) from your launchers and to add
+features such as USB passthrough. The host scans no launcher on its own: install one plugin per
+launcher you use, and its titles appear on every client. SteamGridDB, Libretro and IGDB fill missing
+covers and details for all of them ([Art & Metadata](/docs/game-library#filling-missing-art-and-details)).
+
+| Plugin | Host | What it does |
+|---|---|---|
+| **Steam** | Linux, Windows | Installed games and non-Steam shortcuts with Steam's art, plus Big Picture and desktop tiles. |
+| **Lutris** | Linux | Your Lutris games with art, and a tile that opens Lutris. |
+| **Heroic Games Launcher** | Linux | Everything Heroic manages (Epic, GOG, Amazon), and a tile that opens Heroic. |
+| **Hydra Launcher** | Linux, Windows | The games in your Hydra library that are installed or downloading, started through Hydra. |
+| **Desktop entries** | Linux | Every Game-category menu entry, Flatpak included, that no other plugin lists. |
+| **Bottles** | Linux | The programs in each Bottle, launched through `bottles-cli`. |
+| **Epic Games Store** | Windows | Installed Epic titles. |
+| **GOG** | Windows | Installed GOG games, launched directly without Galaxy. |
+| **Playnite** | Windows | Your whole [Playnite](https://playnite.link) library, launched through Playnite ([setup](/docs/plugin-setup#playnite)). |
+| **Ubisoft Connect** | Windows | Installed Ubisoft titles, launched through Ubisoft Connect. |
+| **Amazon Games** | Windows | Installed Amazon Games titles, launched through the Amazon Games app. |
+| **Battle.net** | Windows | Installed Blizzard titles, launched through Battle.net, which must be running. |
+| **EA app** | Windows | Games the EA app installed, launched through the EA app. |
+| **Rockstar Games** | Windows | Games the Rockstar Games Launcher installed, launched through the launcher. |
+| **Xbox / Game Pass** | Windows | Titles the Xbox app installed, Game Pass included, launched through the Xbox app. |
+| **Windows games** | Windows | Every game Windows recognised through Game Bar that no other plugin lists. |
+| **Game slots** | Linux, Windows | Keeps a copy of a game's config or saves for each device and swaps it in at launch ([setup](/docs/plugin-setup#game-slots)). |
+| **RTSS Frame Cap** | Windows | Caps the game at the client's refresh rate through a [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/) you install ([setup](/docs/plugin-setup#rtss-frame-cap)). |
+| **itch.io** | Linux, Windows | Games installed by the itch app, with covers. |
+| **Waydroid** | Linux | The Android apps installed in Waydroid. |
+| **ROM Manager** | Linux, Windows | Your ROM folders and RomM servers, each game in the host's best emulator for it ([setup](/docs/plugin-setup#rom-manager)). |
+| **SteamGridDB** | Linux, Windows | Covers, heroes and logos for every game in the library. Needs a free API key. |
+| **Libretro** | Linux, Windows | Box art, developer, publisher, year and genres for ROM Manager's games. |
+| **IGDB** | Linux, Windows | Description, developer, publisher, year, genres and player count for every game. Needs a free Twitch app. |
+| **Play history** | Linux, Windows | How long each game was played and on which device, on the game's page. |
+| **Stats black box** | Linux, Windows | Records the streaming stats of every stream and keeps the last twenty, under **Diagnostics** → **Performance**. |
+| **VirtualHere** | Linux, Windows | Hands a USB device on the couch to the host while you play ([setup](/docs/plugin-setup#virtualhere-usb-passthrough)). |
+
+ROM Manager, Playnite, VirtualHere, Game slots and RTSS Frame Cap need a few steps after you
+install them: [Plugin setup](/docs/plugin-setup) walks through each one.
+
+## Install from the console
+
+1. Open **Plugins** → **Installed** and check the **Plugin runner** card. Every plugin runs inside
+   this service.
+   - **Not installed**: install the runner ([Troubleshooting](#the-plugin-runner-isnt-installed)).
+   - **Disabled**: press **Enable runner**. The runner is on by default except on Arch and the
+     Steam Deck on-device build.
+   - **Stopped**: it is enabled but not running; see
+     [Troubleshooting](#the-plugin-runner-keeps-failing-to-start).
+2. **Browse** → pick a plugin → **Install**. The host installs it and restarts the runner. Browse
+   groups plugins into **Game sources**, **Art & Metadata** and **Tools**; **Detected** marks a
+   launcher found on this host.
+
+A plugin with its own page opens from its name under **Plugins** → **Installed**; **Pin to
+sidebar** on that page keeps it in the sidebar. A plugin that keeps something per game adds a tab
+to each game's page in **Library** instead.
+
+### Badges and catalogs
+
+Every catalog entry pins one exact version and its package hash, and the host re-checks that hash
+before it installs.
+
+| Badge | Where it came from |
+|---|---|
+| **Verified** | The built-in unom catalog. unom reviewed this exact package. |
+| **External source** | A catalog you added. Pinned and hash-checked, but nobody at unom reviewed it. |
+| **Unverified** | Installed from a package spec. Nothing pins it; you type the spec again to confirm. |
+| **Installed via CLI** | Installed from the command line, so the host doesn't know where it came from. |
+
+A catalog can also withdraw a version: the console then refuses to install it and warns on
+**Installed** if you already have it.
+
+Plugins don't run on a profile that uses an existing Linux account. A profile on an existing
+Windows account installs **Verified** plugins only: any other would run code nobody at unom
+reviewed as that person.
+
+To add a catalog: **Sources** → **Add source**, with a name, the index URL and
+optionally its `ed25519:…` public key. With a key set, the host accepts only a signed index from
+that source. Plugins from it are never **Verified**.
+
+## Install from the CLI
+
+<Tabs items={['Linux', 'Windows']}>
+<Tab value="Linux">
+
+```sh
+punktfunk-host plugins add rom-manager
+punktfunk-host plugins enable           # only if the runner is off
+```
+
+</Tab>
+<Tab value="Windows">
+
+Run from an elevated PowerShell; the plugins directory is admin-owned.
+
+```powershell
+punktfunk-host plugins add playnite
+punktfunk-host plugins enable           # only if the runner is off
+```
+
+If `punktfunk-host` isn't found, open a new terminal, or use
+`& "$env:ProgramFiles\punktfunk\punktfunk-host.exe"`.
+
+</Tab>
+</Tabs>
+
+Every `plugins` command is in [Host CLI](/docs/host-cli#plugins).
+
+A bare name installs the first-party package from Punktfunk's registry: `playnite` is
+`@punktfunk/plugin-playnite`. Any other name comes from the public npm registry and needs
+`--allow-public-registry`.
+
+## Where plugins run
+
+Each plugin runs in a sandbox of its own: no network unless it declared one, and only the folders
+it declared plus the ones you allowed. It can change only its own library entries. On **Linux** the
+sandbox needs `bubblewrap`, which the packages install, and unprivileged user namespaces. On
+**Windows** it is an AppContainer under the `NT AUTHORITY\LocalService` account, which can read
+Program Files but not user profiles or other drives. Still, a plugin is code on your host: install
+only plugins you trust.
+
+Scripts you put in `~/.config/punktfunk/scripts/` are your own code; they run in the runner itself,
+not in a plugin sandbox.
+
+## Give a plugin a folder
+
+A plugin can't know where you keep ROMs or games. When it finds a folder it can't read, the console
+asks for it, with the path and whether it wants read or write access. Choose **Allow** or **Don't
+allow**; **Later** keeps the request under **Library** → **Sources**. Allowing restarts the plugin,
+or the whole runner for a folder in your home.
+
+On Windows the runner can't read your user profile, so a launcher installed there looks like it
+isn't installed until you allow its folder.
+
+A folder you type into a plugin's form, on its settings or on a game's tab, is allowed when you
+save. The form says so under the field. Only folders you add count, and the host still refuses
+your whole home, `~/.ssh` and its own config folder.
+
+**Plugins** → **Installed** lists every grant and denial: remove a grant there, or choose
+**Ask again**. The CLI does the same with `grant`, `access` and `revoke`. Use `--write` only when
+the plugin must change files in that folder. On Windows, write access can't be given inside
+Program Files or ProgramData: every plugin runs as the same account there.
+
+On Windows, allowing a whole folder updates every file in it, which can take minutes on a large
+game folder. The console and the CLI show how long it has been running. Plugins that ask for
+less, like Steam, land at once.
+
+## Update and remove
+
+- **Update:** **Update to &lt;version&gt;** or **Update all** on **Installed** installs the
+  catalog's version and restarts the runner. `punktfunk-host plugins add <name>` installs the
+  newest version in the registry instead.
+- **Remove:** **Uninstall**, or `punktfunk-host plugins remove <name>`. Both drop the plugin's
+  titles from the library and restart the runner. Its settings stay in
+  `plugin-state/<plugin>/` in the config directory, so a reinstall picks them up.
+- **Stop every plugin:** **Disable runner** on **Installed**, or `punktfunk-host plugins disable`.
+  The host keeps streaming; you lose plugin game sources and automation.
+
+## Troubleshooting
+
+### The plugin runner isn't installed
+
+The runner is its own package. Install it, then press **Enable runner**:
+
+| Host | Install |
+|---|---|
+| Ubuntu | `sudo apt install punktfunk-scripting` |
+| Fedora | `sudo dnf install punktfunk-scripting` |
+| Arch | `sudo pacman -Syu punktfunk-scripting` |
+| Steam Deck on-device build | Re-run `scripts/steamdeck/install.sh` |
+| NixOS | `services.punktfunk.scripting.enable` (on whenever the host is) |
+| Windows | Re-run the host setup |
+
+Installed but still reported missing? The host service can't find the `punktfunk-scripting`
+executable on its `PATH`. Point `PUNKTFUNK_SCRIPTING` at it ([Configuration](/docs/configuration)).
+
+### The plugin runner keeps failing to start
+
+Read its log: `journalctl --user -u punktfunk-scripting -f` on Linux,
+`%ProgramData%\punktfunk\plugin-state\runner.log` on Windows. The console's **Troubleshooting**
+page shows plugin output too, under the `plugin:<name>` sources (`plugin:runner` for the runner).
+A log that ends with `plugins can't be sandboxed here` is the [next entry](#plugins-cant-be-sandboxed-here).
+
+### Plugins can't be sandboxed here
+
+The game library is empty and the **Plugin runner** card says **Stopped**. The runner can't build
+the sandbox each plugin runs in, so it stops at start instead of running one without it.
+**Diagnostics** → **Troubleshooting** → **Health checks** lists it as **Plugins can't be sandboxed
+here** or **The plugin runner has stopped**, with the reason.
+
+Repair the sandbox, then start the runner. It stays stopped until you do.
+
+| Host | Repair | Start the runner |
+|---|---|---|
+| Linux | Install `bubblewrap` 0.8 or newer, or allow unprivileged user namespaces. | `systemctl --user restart punktfunk-scripting` |
+| Windows | Re-run the host setup. | `Start-ScheduledTask -TaskName PunktfunkScripting`, from an elevated PowerShell |
+
+As a last resort on Linux, `Environment=PUNKTFUNK_PLUGIN_SANDBOX=off` in
+`systemctl --user edit punktfunk-scripting` runs plugins with your whole account's access; the
+console warns while it is set.
+
+### A plugin can't read one of its folders
+
+Open **Library** → **Sources** and allow the folder there. The host refuses missing drives and
+protected paths outright; its log names each one (`plugin folder request refused`).
+
+### Plugin interfaces are unavailable
+
+The console couldn't open its plugin port (TCP 47993 by default). Set `PUNKTFUNK_UI_PLUGIN_PORT` to
+a free port ([Configuration](/docs/configuration)) and restart the console.
+
+### Trust this plugin's port once
+
+Your browser hasn't accepted the host's certificate for the plugin port, or the port is closed. See
+[A plugin's interface doesn't load](/docs/troubleshooting-connect#a-plugins-interface-doesnt-load).
+
+### No plugin output yet
+
+The runner isn't running. Check with `punktfunk-host plugins status`.
+
+## Writing a plugin
+
+Plugins are TypeScript packages built on `@punktfunk/plugin-kit`. See
+[Writing plugins](/docs/developers/writing-plugins).

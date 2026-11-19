@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Text a person reads comes from l10n/messages, generated into :kit (l10n/README.md). Only
+     the product name stays here: it is never translated. -->
+<resources>
+    <string name="app_name" translatable="false">Punktfunk</string>
+</resources>
